@@ -1,0 +1,9 @@
+# Never commit secrets or per-machine state
+token
+config.json
+*.sock
+*.log
+tools_cache.json
+__pycache__/
+*.pyc
+.DS_Store

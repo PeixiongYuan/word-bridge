@@ -1,0 +1,10 @@
+{
+  "allowed_documents": [
+    "report.docx",
+    "response_letter.docx"
+  ],
+  "author": "Claude",
+  "ssh_host": "myserver",
+  "remote_socket": "/home/YOUR_REMOTE_USER/.word-bridge/bridge.sock",
+  "local_socket": "~/.word-bridge/bridge.sock"
+}
