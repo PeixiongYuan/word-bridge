@@ -35,6 +35,7 @@ on vis(d, a, b)
 		set r to create range d start a end b
 		set s to content of r
 	end tell
+	if s is missing value then return 0
 	return (count of s)
 end vis
 
@@ -167,6 +168,7 @@ on run argv
 						set got to ""
 					end if
 				end tell
+				if got is missing value then set got to ""
 				if not (my textsEqual(got, middleOld)) then return "ERR" & my fieldSep & "verify_failed" & my fieldSep & got
 				tell application "Microsoft Word"
 					set oldName to user name
@@ -197,6 +199,7 @@ on run argv
 				tell application "Microsoft Word"
 					set got to content of (create range d start p end q)
 				end tell
+				if got is missing value then set got to ""
 				if not (my textsEqual(got, findText)) then return "ERR" & my fieldSep & "verify_failed" & my fieldSep & got
 				tell application "Microsoft Word"
 					set oldName to user name
@@ -234,6 +237,113 @@ on run argv
 					end repeat
 				end tell
 				return "OK" & my fieldSep & nr & my fieldSep & nc & my recSep & my joinList(revLines, my recSep) & (character id 29) & my joinList(comLines, my recSep)
+
+			else if op is "locate" then
+				-- argv: locate doc findText occurrence  → 定位文字在文档中的位置
+				set findText to item 3 of argv
+				set occ to (item 4 of argv) as integer
+				set {locStatus, n, k, t, docEnd, excess} to my locateVisible(d, findText, occ)
+				if locStatus is not "ok" then return "ERR" & my fieldSep & locStatus & my fieldSep & n
+				set p to my posForVisible(d, k, docEnd, excess)
+				return "OK" & my fieldSep & n & my fieldSep & p
+
+			else if op is "images" then
+				-- 列出文档里的嵌入式图片：序号、类型、宽高（磅）、位置、是否已被修订删除、前后文字
+				set imgRows to {}
+				tell application "Microsoft Word"
+					set nShapes to count of inline shapes of d
+					set nFloating to count of shapes of d
+					set docEnd to end of content of text object of d
+				end tell
+				repeat with i from 1 to nShapes
+					tell application "Microsoft Word"
+						set shp to inline shape i of d
+						set shpKind to (inline shape type of shp) as text
+						set shpW to width of shp
+						set shpH to height of shp
+						set shpStart to start of content of text object of shp
+						set shpEnd to end of content of text object of shp
+						set selfText to content of text object of shp
+						set ctxA to shpStart - 150
+						if ctxA < 0 then set ctxA to 0
+						set ctxB to shpEnd + 260
+						if ctxB > docEnd then set ctxB to docEnd
+						set textAbove to ""
+						if shpStart > ctxA then set textAbove to content of (create range d start ctxA end shpStart)
+						set textBelow to ""
+						if ctxB > shpEnd then set textBelow to content of (create range d start shpEnd end ctxB)
+					end tell
+					if selfText is missing value then set selfText to ""
+					if textAbove is missing value then set textAbove to ""
+					if textBelow is missing value then set textBelow to ""
+					set end of imgRows to (i as text) & my fieldSep & shpKind & my fieldSep & (shpW as text) & my fieldSep & (shpH as text) & my fieldSep & (shpStart as text) & my fieldSep & ((count of selfText) as text) & my fieldSep & textAbove & my fieldSep & textBelow
+				end repeat
+				return "OK" & my fieldSep & nShapes & my fieldSep & nFloating & my recSep & my joinList(imgRows, my recSep)
+
+			else if op is "replaceimage" then
+				-- argv: replaceimage doc index expectedStart imagePath author
+				-- 在原位置插入新图（沿用原图宽度，高度按新图比例），再删除旧图；两步都记为修订。
+				set shpIndex to (item 3 of argv) as integer
+				set expectedStart to (item 4 of argv) as integer
+				set imgPath to item 5 of argv
+				set authorName to item 6 of argv
+				tell application "Microsoft Word"
+					set nShapes to count of inline shapes of d
+				end tell
+				if shpIndex < 1 or shpIndex > nShapes then return "ERR" & my fieldSep & "badindex" & my fieldSep & nShapes
+				tell application "Microsoft Word"
+					set oldShp to inline shape shpIndex of d
+					set oldStart to start of content of text object of oldShp
+					set oldW to width of oldShp
+					set oldH to height of oldShp
+					set oldAlt to ""
+					try
+						set oldAlt to alternative text of oldShp
+						if oldAlt is missing value then set oldAlt to ""
+					end try
+				end tell
+				if oldStart is not expectedStart then return "ERR" & my fieldSep & "stale" & my fieldSep & oldStart
+				set stage to "start"
+				tell application "Microsoft Word"
+					set oldName to user name
+					set track revisions of d to true
+					try
+						if authorName is not "" then set user name to authorName
+						set insRange to create range d start oldStart end oldStart
+						make new inline picture at insRange with properties {file name:imgPath, link to file:false, save with document:true}
+						set stage to "inserted"
+						-- 新图现在排在原序号上，旧图顺延一位
+						set newShp to inline shape shpIndex of d
+						if (start of content of text object of newShp) is not oldStart then error "插入后在预期位置找不到新图片"
+						set natW to width of newShp
+						set natH to height of newShp
+						try
+							set lock aspect ratio of newShp to true
+						end try
+						set width of newShp to oldW
+						set height of newShp to (oldW * natH / natW)
+						if oldAlt is not "" then
+							try
+								set alternative text of newShp to oldAlt
+							end try
+						end if
+						set stage to "resized"
+						set oldShp2 to inline shape (shpIndex + 1) of d
+						set oldStart2 to start of content of text object of oldShp2
+						if oldStart2 is not (oldStart + 1) then error "插入后在预期位置找不到旧图片"
+						set content of (create range d start oldStart2 end (oldStart2 + 1)) to ""
+						set stage to "done"
+						set user name to oldName
+					on error errMsg
+						set user name to oldName
+						return "ERR" & my fieldSep & "image_failed" & my fieldSep & stage & my fieldSep & errMsg
+					end try
+					set finalShp to inline shape shpIndex of d
+					set newW to width of finalShp
+					set newH to height of finalShp
+					set nRev to count of revisions of d
+				end tell
+				return "OK" & my fieldSep & (oldW as text) & my fieldSep & (oldH as text) & my fieldSep & (natW as text) & my fieldSep & (natH as text) & my fieldSep & (newW as text) & my fieldSep & (newH as text) & my fieldSep & nRev
 			end if
 			return "ERR" & my fieldSep & "unknown_op"
 		end timeout

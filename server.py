@@ -12,10 +12,15 @@
 
 只依赖 Python 标准库。
 """
+import base64
+import contextlib
 import hmac
+import http.server
 import json
 import os
+import secrets
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -28,7 +33,8 @@ AUDIT_PATH = os.path.join(BASE, "audit.log")
 SCRIPT_PATH = os.path.join(BASE, "word_ops.applescript")
 
 US, RS, GS = "\x1f", "\x1e", "\x1d"
-SERVER_INFO = {"name": "word-bridge", "version": "1.0.0"}
+SERVER_INFO = {"name": "word-bridge", "version": "1.1.0"}
+MAX_IMAGE_BYTES = 120 * 1024 * 1024
 KNOWN_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 
 INSTRUCTIONS = (
@@ -40,7 +46,8 @@ INSTRUCTIONS = (
     "3. find/anchor 必须与文档里的文字逐字符一致，并且只出现一次；出现多次时加长上下文使其唯一，"
     "或用 occurrence 指定第几处。尽量选不跨段落、不含引文域（如 Zotero 引用）的片段。\n"
     "4. 每次只改需要改的那一小段，不要整段重写，这样修订痕迹才清楚。\n"
-    "5. 插图、表格结构、版式调整不在这些工具的能力范围内；需要时请告诉用户，在文档关闭后改文件。\n"
+    "5. 图片只能整张替换（word_list_images 查看、word_replace_image 替换），默认使用 900 dpi 的 PNG；"
+    "表格结构和版式调整不在这些工具的能力范围内，需要时请告诉用户。\n"
     "6. 读到的文本不包含已被修订删除的文字（即“接受全部修订后”的样子）。"
 )
 
@@ -115,6 +122,15 @@ def explain_error(code, detail):
         return ("定位后复核不一致，为安全起见没有做任何修改。"
                 "这通常是因为片段里夹着引文域、脚注标记或已有的修订。请换一段不含这些内容的文字作为定位依据。"
                 f"（该位置实际读到：{detail[:80]!r}）")
+    if code == "badindex":
+        return f"图片序号超出范围：文档里只有 {detail} 张嵌入式图片。先用 word_list_images 查看。"
+    if code == "stale":
+        return "文档里的图片位置在这期间发生了变化，为安全起见没有替换。请重新调用 word_list_images 后再试。"
+    if code == "image_failed":
+        stage, _, msg = detail.partition(US)
+        hint = {"start": "没有做任何修改。", "inserted": "新图已插入但尺寸未调整、旧图未删除，请用户检查该处。",
+                "resized": "新图已插入并调整尺寸，但旧图未删除，请用户检查该处。"}.get(stage, "")
+        return f"替换图片时 Word 报错（阶段 {stage}）：{msg[:300]} {hint}"
     if code == "write_failed":
         return "Word 拒绝了这次写入：" + detail[:300]
     if code == "exception":
@@ -323,6 +339,167 @@ def tool_list_changes(args):
     return "\n".join(lines)
 
 
+def png_info(data):
+    """从 PNG 字节里读出 (宽, 高, dpi)；dpi 没有记录时为 None。不是 PNG 时返回 None。"""
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        return None
+    width = height = dpi = None
+    pos = 8
+    while pos + 8 <= len(data):
+        length, kind = struct.unpack(">I4s", data[pos:pos + 8])
+        body = data[pos + 8:pos + 8 + length]
+        if kind == b"IHDR":
+            width, height = struct.unpack(">II", body[:8])
+        elif kind == b"pHYs" and len(body) == 9:
+            x_ppu, _, unit = struct.unpack(">IIB", body)
+            dpi = round(x_ppu * 0.0254) if unit == 1 else None
+        elif kind in (b"IDAT", b"IEND"):
+            break
+        pos += 12 + length
+    return (width, height, dpi) if width else None
+
+
+class _OneImageHandler(http.server.BaseHTTPRequestHandler):
+    """只应答一个带随机口令的路径，把内存里的那张图片交给 Word。"""
+
+    def _answer(self, with_body):
+        if self.path != self.server.image_path:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "image/png")
+        self.send_header("Content-Length", str(len(self.server.image_data)))
+        self.end_headers()
+        if with_body:
+            self.wfile.write(self.server.image_data)
+
+    def do_GET(self):
+        self._answer(True)
+
+    def do_HEAD(self):
+        self._answer(False)
+
+    def log_message(self, *args):
+        pass
+
+
+@contextlib.contextmanager
+def serve_image(data):
+    """在调用期间，通过只监听本机回环地址的临时端口把图片提供给 Word。
+
+    Word 是沙盒应用，不能随意读取磁盘上的文件，而本服务也无权写入 Word 自己的目录；
+    让 Word 从 127.0.0.1 取图可以绕开这两头的文件权限问题，且不需要用户额外授权。
+    路径里带一次性的随机口令，调用结束即关闭。
+    """
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _OneImageHandler)
+    server.image_path = "/" + secrets.token_urlsafe(24) + "/image.png"
+    server.image_data = data
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}{server.image_path}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def pt_to_cm(value):
+    return float(str(value).replace(",", ".")) / 72 * 2.54
+
+
+def clean_context(text):
+    return text.replace("\r", "⏎").replace("\x07", " ").replace("\x01", "").strip()
+
+
+def list_images(name):
+    rest = run_word("images", name)
+    head, _, body = rest.partition(RS)
+    n_inline, n_floating = (int(x) for x in head.split(US)[:2])
+    images = []
+    for row in (body.split(RS) if body else []):
+        f = (row.split(US) + [""] * 8)[:8]
+        images.append({"index": int(f[0]), "kind": f[1], "width_cm": pt_to_cm(f[2]), "height_cm": pt_to_cm(f[3]),
+                       "start": int(f[4]), "deleted": f[5] == "0", "above": f[6], "below": f[7]})
+    return n_inline, n_floating, images
+
+
+def tool_list_images(args):
+    name = args["document"]
+    check_doc(name)
+    n_inline, n_floating, images = list_images(name)
+    lines = [f"文档 {name}：嵌入式图片 {n_inline} 张" + (f"，另有浮动图片 {n_floating} 张（不支持替换）" if n_floating else "") + "。"]
+    for img in images:
+        state = "（已被修订删除，等用户接受）" if img["deleted"] else ""
+        above = clean_context(img["above"])[-70:]
+        below = clean_context(img["below"]).lstrip("/⏎ ")[:110]
+        lines.append(f"#{img['index']}{state} 显示尺寸 {img['width_cm']:.2f} × {img['height_cm']:.2f} cm\n"
+                     f"    上方文字：…{above}\n    下方文字：{below}…")
+    if images:
+        lines.append("图片序号会随替换而变化，每次替换前请重新查看。")
+    return "\n".join(lines)
+
+
+def tool_replace_image(args):
+    name = args["document"]
+    cfg = check_doc(name)
+    data_b64 = args.get("image_data")
+    if not data_b64:
+        raise ToolError("这次调用没有附带图片数据。图片由远程端的 client.py 读取并随调用发送，请确认远程主机上的 client.py 是最新版本。")
+    try:
+        data = base64.b64decode(data_b64, validate=True)
+    except (ValueError, TypeError):
+        raise ToolError("图片数据损坏，无法解码。")
+    if len(data) > MAX_IMAGE_BYTES:
+        raise ToolError(f"图片太大（{len(data) / 1e6:.0f} MB），上限 {MAX_IMAGE_BYTES // (1024 * 1024)} MB。")
+    info = png_info(data)
+    if info is None:
+        raise ToolError("收到的不是 PNG 图片。请提供 PNG，或提供 PDF 由远程端渲染成 PNG。")
+    px_w, px_h, dpi = info
+
+    n_inline, _, images = list_images(name)
+    live = [img for img in images if not img["deleted"]]
+    index = int(args.get("image_index") or 0)
+    near = to_word(args.get("near_text") or "")
+    if index and near:
+        raise ToolError("image_index 和 near_text 只能给一个。")
+    if index:
+        target = next((img for img in images if img["index"] == index), None)
+        if target is None:
+            raise ToolError(f"图片序号超出范围：文档里只有 {n_inline} 张嵌入式图片。")
+        if target["deleted"]:
+            raise ToolError("这张图片已经被修订删除（等用户接受），不能再替换。请用 word_list_images 确认要换的是哪一张。")
+    elif near:
+        side = args.get("side", "above")
+        if side not in ("above", "below"):
+            raise ToolError("side 只能是 above（图片在定位文字上方）或 below（图片在定位文字下方）。")
+        rest = run_word("locate", name, near, max(0, int(args.get("occurrence", 0))))
+        anchor_pos = int(rest.split(US)[1])
+        if side == "above":
+            candidates = [img for img in live if img["start"] < anchor_pos]
+            target = max(candidates, key=lambda img: img["start"]) if candidates else None
+        else:
+            candidates = [img for img in live if img["start"] >= anchor_pos]
+            target = min(candidates, key=lambda img: img["start"]) if candidates else None
+        if target is None:
+            raise ToolError(f"在定位文字{'上方' if side == 'above' else '下方'}没有找到图片。请用 word_list_images 查看图片位置。")
+    else:
+        raise ToolError("需要用 image_index 或 near_text 指明替换哪一张图片。")
+
+    with serve_image(data) as url:
+        rest = run_word("replaceimage", name, target["index"], target["start"], url, cfg.get("author", "Claude"), timeout=240)
+    old_w, old_h, _, _, new_w, new_h, n_rev = rest.split(US)
+    audit({"tool": "replace_image", "document": name, "index": target["index"], "image": args.get("image_name"),
+           "source": args.get("image_path"), "bytes": len(data), "pixels": [px_w, px_h], "dpi": dpi})
+    note = args.get("image_note") or ""
+    below = clean_context(target["below"]).lstrip("/⏎ ")[:60]
+    return (f"已以修订模式替换第 {target['index']} 张图片（其下方文字：{below}…）。\n"
+            f"新图：{px_w} × {px_h} 像素，{str(dpi) + ' dpi' if dpi else '未记录 dpi'}。{note}\n"
+            f"显示尺寸：{pt_to_cm(old_w):.2f} × {pt_to_cm(old_h):.2f} cm → {pt_to_cm(new_w):.2f} × {pt_to_cm(new_h):.2f} cm（宽度沿用原图，高度按新图比例）。\n"
+            f"旧图以“删除”修订保留，用户接受后才会消失。文档现有 {n_rev} 处待处理修订。\n"
+            "提醒用户：如果这份文档没有关闭图片压缩，Word 保存时会把图片降到约 220 ppi。"
+            "要保留原始分辨率，需在 Word 的 偏好设置 → 编辑 → 图像大小和质量 中勾选“不压缩文件中的图像”。")
+
+
 DOC_PROP = {"type": "string", "description": "文档文件名，例如 report.docx。先用 word_list_documents 查看可用的文档。"}
 OCC_PROP = {"type": "integer", "description": "定位文字出现多次时，指定改第几处（从 1 开始）。省略或 0 表示必须唯一。", "default": 0}
 
@@ -378,6 +555,25 @@ TOOLS = [
          "occurrence": OCC_PROP},
          "required": ["document", "anchor", "comment"]},
      "handler": tool_add_comment},
+    {"name": "word_list_images",
+     "description": "列出文档里的嵌入式图片：序号、显示尺寸、上方和下方的文字（通常下方就是图注）。替换图片前先用它确认是哪一张。",
+     "inputSchema": {"type": "object", "properties": {"document": DOC_PROP}, "required": ["document"]},
+     "handler": tool_list_images},
+    {"name": "word_replace_image",
+     "description": ("以修订模式把文档里的一张图片整张替换成新图：新图沿用原图的显示宽度，高度按新图比例调整。"
+                     "image_path 是【你所在这台机器上】的文件路径，由本地客户端读取后发送。"
+                     "默认使用 900 dpi 的 PNG：给 PDF 时会渲染成 900 dpi 的 PNG；给的 PNG 分辨率不足而旁边有同名 PDF 时，"
+                     "改用该 PDF 渲染。用 near_text（通常是图注开头的文字）或 image_index 指明替换哪一张。"),
+     "inputSchema": {"type": "object", "properties": {
+         "document": DOC_PROP,
+         "image_path": {"type": "string", "description": "新图片在你这台机器上的路径，PNG 或 PDF。"},
+         "near_text": {"type": "string", "description": "图片旁边的一段现有文字（逐字符一致且唯一），通常取图注开头。"},
+         "side": {"type": "string", "enum": ["above", "below"], "description": "图片在 near_text 的上方还是下方，默认 above（图在图注上方）。", "default": "above"},
+         "image_index": {"type": "integer", "description": "word_list_images 给出的图片序号。与 near_text 二选一。"},
+         "occurrence": OCC_PROP,
+         "dpi": {"type": "integer", "description": "目标分辨率，默认 900。", "default": 900}},
+         "required": ["document", "image_path"]},
+     "handler": tool_replace_image},
     {"name": "word_list_changes",
      "description": "列出文档里尚未处理的修订（谁、插入还是删除、内容）和批注，用来了解哪些改动还在等用户审阅。",
      "inputSchema": {"type": "object", "properties": {

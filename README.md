@@ -34,7 +34,7 @@ word_ops.applescript        turns on Track Changes, locates the text, rewrites i
 Microsoft Word              the open window updates immediately
 ```
 
-Only text travels over the tunnel: the instructions, and document text when the agent reads. The `.docx` file is never transferred.
+Only instructions, document text and replacement images travel over the tunnel. The `.docx` file is never transferred.
 
 ## Tools
 
@@ -46,6 +46,8 @@ Only text travels over the tunnel: the instructions, and document text when the 
 | `word_replace_text` | Replaces text as a tracked change (empty replacement deletes) |
 | `word_insert_text` | Inserts text before or after an anchor, as a tracked change |
 | `word_add_comment` | Attaches a Word comment to a piece of text |
+| `word_list_images` | Lists the inline pictures with their size and the text above and below each |
+| `word_replace_image` | Replaces one picture with a new image, as a tracked change |
 | `word_list_changes` | Lists pending revisions and comments |
 
 Every write is a tracked change or a comment, authored as the name set in `config.json` (default `Claude`). The bridge never saves, closes, opens, accepts or rejects anything.
@@ -100,6 +102,17 @@ The first time the server talks to Word, macOS may ask whether to allow it to co
 { "permissions": { "allow": ["mcp__word-bridge__word_read_document", "mcp__word-bridge__word_replace_text"] } }
 ```
 
+## Replacing pictures
+
+`word_replace_image` takes a path on the remote host. The client reads the file there and sends it with the call; the Mac server hands it to Word through a one-off address on the loopback interface (`127.0.0.1`), so no file permissions are involved on the Mac.
+
+- The default target is a **900 dpi PNG**. A PDF is rendered to PNG at that resolution (first page; needs `pdftocairo` or `pdftoppm` on the remote host). A PNG below the target resolution is swapped for a PDF of the same name next to it, if there is one; otherwise it is used as is and the result says so. Pass `dpi` to change the target.
+- The new picture keeps the old picture's display width; the height follows the new image's proportions.
+- The replacement is tracked: the new picture is an insertion and the old one stays as a deletion until you accept it.
+- Pick the picture with `near_text` (usually the start of its caption) or with the index from `word_list_images`.
+
+**Word may shrink the picture when it saves.** Unless picture compression is turned off for the document, Word downsamples pictures to about 220 ppi on save; in our test a 6375-pixel-wide figure was stored at 440 pixels. To keep the full resolution, tick "Do not compress images in file" under Word > Preferences > Edit > Image Size and Quality for that document. The bridge cannot read or change this setting.
+
 ## The SSH tunnel
 
 The server keeps a reverse tunnel alive by itself. It only ever rides the SSH master connection you already opened; if that connection is gone it does nothing and never tries to authenticate. This matters on hosts that need a one-time password: after you log in again, the tunnel is back within about 30 seconds.
@@ -119,11 +132,12 @@ Host myserver
 - Every connection must present the token before anything else is processed.
 - Only documents named in `allowed_documents`, and currently open in Word, can be read or edited.
 - All writes are logged to `~/.word-bridge/audit.log`.
+- While a picture is being replaced, it is served on `127.0.0.1` at a random port under a one-time random path, and the listener is closed as soon as Word has fetched it.
 - The agent can read the text of allowed documents. Do not allow documents you would not show it.
 
 ## Limitations
 
-- **Text only.** No figures, table structure or layout. Tables are read as flattened text.
+- **No table structure or layout changes.** Tables are read as flattened text. Pictures can only be replaced whole, and only inline pictures (not floating ones).
 - **Matching is exact.** The anchor text must match character for character and be unique, or the call is refused. Anchors that contain citation fields, footnote marks or existing revisions may fail the verification step; the bridge then makes no change.
 - **Documents are matched by file name, not path.** Two files with the same name are indistinguishable.
 - **Authorship is set by briefly switching Word's user name** during each write and restoring it afterwards. If you type in that instant, your keystrokes may be attributed to the agent.
