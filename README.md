@@ -147,7 +147,6 @@ Host myserver
 - **Authorship is set by briefly switching Word's user name** during each write and restoring it afterwards. If you type in that instant, your keystrokes may be attributed to the agent.
 - **Reading excludes tracked deletions.** The text is what you would get after accepting all changes.
 - **Tested on one setup:** Word for Mac 16.114, macOS client with OpenSSH 10, a Linux remote host, Claude Code 2.1. Word for Windows is not supported (the bridge uses AppleScript).
-- Tool descriptions and messages are currently written in Chinese.
 
 ## Troubleshooting
 

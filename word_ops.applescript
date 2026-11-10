@@ -1,6 +1,6 @@
--- Word 桥接：所有对 Word 的操作都在这里。由 server.py 通过 osascript 调用。
--- 输出格式：字段用 ASCII 31 分隔、记录用 ASCII 30 分隔，第一个字段是 OK 或 ERR。
--- 约定：只做带修订痕迹的修改；从不保存、关闭、接受或拒绝修订。
+-- Word bridge: every operation on Word lives here. Called by server.py through osascript.
+-- Output format: fields are separated by ASCII 31 and records by ASCII 30; the first field is OK or ERR.
+-- Contract: only tracked edits are made; nothing is ever saved, closed, accepted or rejected.
 
 property fieldSep : character id 31
 property recSep : character id 30
@@ -12,7 +12,7 @@ on joinList(lst, sep)
 	return s
 end joinList
 
--- 精确（区分大小写等）按 findText 切分 t
+-- Split t on findText exactly (case-sensitive and so on)
 on splitExact(t, findText)
 	considering case, diacriticals, hyphens, punctuation and white space
 		set AppleScript's text item delimiters to findText
@@ -28,7 +28,7 @@ on textsEqual(a, b)
 	end considering
 end textsEqual
 
--- [a,b) 区间内的“可见”字符数（不含已被修订删除的文字、域代码等）
+-- Number of "visible" characters in [a,b), not counting tracked-deleted text, field codes and the like
 on vis(d, a, b)
 	if b ≤ a then return 0
 	tell application "Microsoft Word"
@@ -39,8 +39,8 @@ on vis(d, a, b)
 	return (count of s)
 end vis
 
--- 把“可见文本中的偏移 k”换算成 Word 文档位置：
--- 返回最大的 p，使 [0,p) 的可见字符数 ≤ k
+-- Convert an offset k in the visible text into a position in the Word document:
+-- returns the largest p such that [0,p) has at most k visible characters
 on posForVisible(d, k, docEnd, excess)
 	if k ≤ 0 then
 		set base to 0
@@ -64,12 +64,12 @@ on posForVisible(d, k, docEnd, excess)
 	return lo
 end posForVisible
 
--- 从 p 起最小的 q，使 [p,q) 的可见字符数 ≥ need
+-- The smallest q from p on such that [p,q) has at least `need` visible characters
 on endForVisible(d, p, need, docEnd)
 	if need ≤ 0 then return p
 	set lo to p
 	set hi to docEnd
-	-- 先指数扩张，避免每次都取到文末
+	-- Grow exponentially first, so that not every probe reads up to the end of the document
 	set span to need
 	repeat
 		set cand to p + span
@@ -94,8 +94,8 @@ on endForVisible(d, p, need, docEnd)
 	return lo
 end endForVisible
 
--- 在文档里定位 findText 的第 occ 次出现（occ=0 表示必须唯一）。
--- 返回 {状态, 出现次数, 可见偏移 k, 文档全文 t, docEnd, excess}
+-- Locate the occ-th occurrence of findText in the document (occ=0 means it must be unique).
+-- Returns {status, number of occurrences, visible offset k, full text t, docEnd, excess}
 on locateVisible(d, findText, occ)
 	tell application "Microsoft Word"
 		set t to content of text object of d
@@ -239,7 +239,7 @@ on run argv
 				return "OK" & my fieldSep & nr & my fieldSep & nc & my recSep & my joinList(revLines, my recSep) & (character id 29) & my joinList(comLines, my recSep)
 
 			else if op is "locate" then
-				-- argv: locate doc findText occurrence  → 定位文字在文档中的位置
+				-- argv: locate doc findText occurrence  → position of the anchor text in the document
 				set findText to item 3 of argv
 				set occ to (item 4 of argv) as integer
 				set {locStatus, n, k, t, docEnd, excess} to my locateVisible(d, findText, occ)
@@ -248,7 +248,7 @@ on run argv
 				return "OK" & my fieldSep & n & my fieldSep & p
 
 			else if op is "images" then
-				-- 列出文档里的嵌入式图片：序号、类型、宽高（磅）、位置、是否已被修订删除、前后文字
+				-- List the inline pictures: index, type, width and height (points), position, whether tracked-deleted, text around
 				set imgRows to {}
 				tell application "Microsoft Word"
 					set nShapes to count of inline shapes of d
@@ -282,7 +282,7 @@ on run argv
 
 			else if op is "replaceimage" then
 				-- argv: replaceimage doc index expectedStart imagePath author
-				-- 在原位置插入新图（沿用原图宽度，高度按新图比例），再删除旧图；两步都记为修订。
+				-- Insert the new picture at the same position (old width, height from the new proportions), then delete the old one; both steps are tracked.
 				set shpIndex to (item 3 of argv) as integer
 				set expectedStart to (item 4 of argv) as integer
 				set imgPath to item 5 of argv
@@ -312,9 +312,9 @@ on run argv
 						set insRange to create range d start oldStart end oldStart
 						make new inline picture at insRange with properties {file name:imgPath, link to file:false, save with document:true}
 						set stage to "inserted"
-						-- 新图现在排在原序号上，旧图顺延一位
+						-- The new picture now has the old index; the old picture has moved up by one
 						set newShp to inline shape shpIndex of d
-						if (start of content of text object of newShp) is not oldStart then error "插入后在预期位置找不到新图片"
+						if (start of content of text object of newShp) is not oldStart then error "the new picture was not found at the expected position after inserting it"
 						set natW to width of newShp
 						set natH to height of newShp
 						try
@@ -330,7 +330,7 @@ on run argv
 						set stage to "resized"
 						set oldShp2 to inline shape (shpIndex + 1) of d
 						set oldStart2 to start of content of text object of oldShp2
-						if oldStart2 is not (oldStart + 1) then error "插入后在预期位置找不到旧图片"
+						if oldStart2 is not (oldStart + 1) then error "the old picture was not found at the expected position after inserting the new one"
 						set content of (create range d start oldStart2 end (oldStart2 + 1)) to ""
 						set stage to "done"
 						set user name to oldName

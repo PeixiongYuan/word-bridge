@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Word 桥接客户端（远程主机端）。
+"""Word bridge client (remote host side).
 
-Claude Code 把它当作一个 stdio 的 MCP 服务来启动：
+Claude Code starts it as a stdio MCP server:
     claude mcp add word-bridge -- python3 ~/.word-bridge/client.py
 
-它把每个请求经 SSH 隧道里的 Unix 套接字转给 Mac 上的桥接服务，再把回复原样交还。
-隧道暂时不通时不会退出：工具列表用本地缓存作答，工具调用返回一条说明，隧道恢复后自动重连。
+It forwards each request through a Unix socket inside the SSH tunnel to the bridge server on the Mac and hands the reply back unchanged.
+It does not exit while the tunnel is down: the tool list is answered from a local cache, tool calls return an explanation, and it reconnects by itself.
 
-只依赖 Python 标准库。  用法：client.py [--ping] [--socket PATH]
+Standard library only.  Usage: client.py [--ping] [--socket PATH]
 """
 import base64
 import json
@@ -30,9 +30,9 @@ MAX_PIXELS = 250 * 1000 * 1000
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 
 DOWN_MESSAGE = (
-    "Word 桥接当前连不上用户的 Mac。可能的原因：Mac 休眠或断网、Mac 到这台主机的 SSH 连接断了、"
-    "或 Mac 上的桥接服务没在运行。请告诉用户：在 Mac 上重新建立到这台主机的 SSH 连接，"
-    "桥接会在半分钟内自动恢复；然后再重试这次操作。在此之前不要改用直接改写 docx 文件的办法。"
+    "The Word bridge cannot reach the user's Mac right now. Possible causes: the Mac is asleep or offline, the SSH connection from the Mac to this host has dropped, "
+    "or the bridge server on the Mac is not running. Tell the user to re-establish the SSH connection from the Mac to this host; "
+    "the bridge recovers by itself within about half a minute, then retry. Until then, do not fall back to rewriting the .docx file directly."
 )
 
 
@@ -43,7 +43,7 @@ def socket_path():
 
 
 class Link:
-    """到 Mac 桥接服务的一条连接，断了就在下次请求时重连。"""
+    """One connection to the bridge server on the Mac; reconnects on the next request if it has dropped."""
 
     def __init__(self):
         self.sock = None
@@ -70,7 +70,7 @@ class Link:
         self.reader = None
 
     def request(self, line, expect_reply):
-        """发送一行；需要回复时返回回复行。失败时抛 OSError。"""
+        """Send one line and, when a reply is expected, return the reply line. Raises OSError on failure."""
         for attempt in (1, 2):
             try:
                 if self.sock is None:
@@ -94,7 +94,7 @@ class ImageError(Exception):
 
 
 def png_info(data):
-    """(宽, 高, dpi)；dpi 没有记录时为 None。"""
+    """(width, height, dpi); dpi is None when the file does not record it."""
     if data[:8] != PNG_MAGIC:
         return None
     width = height = dpi = None
@@ -114,7 +114,7 @@ def png_info(data):
 
 
 def png_with_dpi(data, dpi):
-    """返回写入了指定 dpi 的 PNG（替换或新增 pHYs 块），像素不变。"""
+    """Return the PNG with the given dpi written into it (replacing or adding the pHYs chunk); the pixels are unchanged."""
     ppm = round(dpi / 0.0254)
     body = struct.pack(">IIB", ppm, ppm, 1)
     phys = struct.pack(">I", 9) + b"pHYs" + body + struct.pack(">I", zlib.crc32(b"pHYs" + body) & 0xffffffff)
@@ -144,69 +144,69 @@ def find_renderer():
 
 
 def render_pdf(pdf_path, dpi):
-    """把 PDF 的第一页渲染成指定 dpi 的 PNG，返回字节。"""
+    """Render the first page of a PDF to a PNG at the given dpi and return the bytes."""
     tool, exe = find_renderer()
     if exe is None:
-        raise ImageError("这台机器上没有 pdftocairo 或 pdftoppm，无法把 PDF 渲染成 PNG。请直接提供 PNG。")
+        raise ImageError("Neither pdftocairo nor pdftoppm is available on this machine, so the PDF cannot be rendered to PNG. Provide a PNG instead.")
     with tempfile.TemporaryDirectory(prefix="word-bridge-") as tmp:
         prefix = os.path.join(tmp, "page")
         cmd = [exe, "-png", "-r", str(dpi), "-f", "1", "-l", "1", "-singlefile", pdf_path, prefix]
         try:
             proc = subprocess.run(cmd, capture_output=True, timeout=240)
         except subprocess.TimeoutExpired:
-            raise ImageError(f"用 {tool} 渲染 {os.path.basename(pdf_path)} 超时。")
+            raise ImageError(f"Rendering {os.path.basename(pdf_path)} with {tool} timed out.")
         out_path = prefix + ".png"
         if proc.returncode != 0 or not os.path.isfile(out_path):
-            raise ImageError(f"{tool} 渲染失败：" + proc.stderr.decode("utf-8", "replace").strip()[:200])
+            raise ImageError(f"{tool} failed to render the PDF: " + proc.stderr.decode("utf-8", "replace").strip()[:200])
         with open(out_path, "rb") as fh:
             data = fh.read()
     return png_with_dpi(data, dpi)
 
 
 def prepare_image(args):
-    """读取 image_path，按默认规则得到 PNG，并把数据写进调用参数。返回给模型看的说明。"""
+    """Read image_path, turn it into a PNG by the default rules, and add the data to the call arguments. Returns the note shown to the model."""
     raw = args.get("image_path")
     if not raw:
-        raise ImageError("缺少 image_path。")
+        raise ImageError("image_path is missing.")
     try:
         dpi = int(args.get("dpi") or DEFAULT_DPI)
     except (TypeError, ValueError):
-        raise ImageError("dpi 必须是整数。")
+        raise ImageError("dpi must be an integer.")
     if not 72 <= dpi <= 2400:
-        raise ImageError("dpi 应在 72 到 2400 之间。")
+        raise ImageError("dpi must be between 72 and 2400.")
     path = os.path.abspath(os.path.expanduser(raw))
     if not os.path.isfile(path):
-        raise ImageError(f"找不到图片文件：{path}")
+        raise ImageError(f"Image file not found: {path}")
     ext = os.path.splitext(path)[1].lower()
     if ext == ".pdf":
         data = render_pdf(path, dpi)
-        note = f"由 {os.path.basename(path)} 渲染为 {dpi} dpi 的 PNG。"
+        note = f"Rendered from {os.path.basename(path)} to a {dpi} dpi PNG."
     elif ext == ".png":
         with open(path, "rb") as fh:
             data = fh.read()
         info = png_info(data)
         if info is None:
-            raise ImageError(f"{os.path.basename(path)} 不是有效的 PNG 文件。")
+            raise ImageError(f"{os.path.basename(path)} is not a valid PNG file.")
         have = info[2]
         sibling = os.path.splitext(path)[0] + ".pdf"
         if (have is None or have < dpi) and os.path.isfile(sibling) and find_renderer()[1]:
             data = render_pdf(sibling, dpi)
-            note = (f"所给 PNG 的分辨率为 {have if have else '未记录'} dpi，低于 {dpi} dpi；"
-                    f"已改用同名的 {os.path.basename(sibling)} 渲染为 {dpi} dpi 的 PNG。")
+            note = (f"The PNG given is at {str(have) + ' dpi' if have else 'an unrecorded resolution'}, below {dpi} dpi; "
+                    f"rendered {os.path.basename(sibling)}, the PDF of the same name, to a {dpi} dpi PNG instead.")
         elif have is None or have < dpi:
-            note = (f"注意：所给 PNG 的分辨率为 {have if have else '未记录'} dpi，低于默认的 {dpi} dpi，"
-                    "旁边也没有可用来重新渲染的同名 PDF，已按原样使用。")
+            note = (f"Note: the PNG given is at {str(have) + ' dpi' if have else 'an unrecorded resolution'}, below the default {dpi} dpi, "
+                    "and there is no PDF of the same name next to it to render from, so it was used as is.")
         else:
-            note = f"使用所给的 PNG（{have} dpi）。"
+            note = f"Used the PNG as given ({have} dpi)."
     else:
-        raise ImageError("只支持 PNG 或 PDF。请把图片导出为 PNG（默认 900 dpi）或提供矢量 PDF。")
+        raise ImageError("Only PNG and PDF are supported. Export the image as a PNG (900 dpi by default) or provide a vector PDF.")
     info = png_info(data)
     if info is None:
-        raise ImageError("得到的图片不是有效的 PNG。")
+        raise ImageError("The resulting image is not a valid PNG.")
     if info[0] * info[1] > MAX_PIXELS:
-        raise ImageError(f"图片有 {info[0]} × {info[1]} 像素，超过上限。请降低 dpi 或裁剪页面。")
+        raise ImageError(f"The image is {info[0]} × {info[1]} pixels, above the limit. Lower the dpi or crop the page.")
     if len(data) > MAX_IMAGE_BYTES:
-        raise ImageError(f"图片文件有 {len(data) / 1e6:.0f} MB，超过上限。")
+        raise ImageError(f"The image file is {len(data) / 1e6:.0f} MB, above the limit.")
     args["image_data"] = base64.b64encode(data).decode("ascii")
     args["image_name"] = os.path.basename(path)
     args["image_path"] = path
@@ -215,14 +215,14 @@ def prepare_image(args):
 
 
 def fallback(msg):
-    """隧道不通时本地作答，保证 Claude Code 不会把这个 MCP 服务判为失败。"""
+    """Answer locally while the tunnel is down, so that Claude Code does not mark this MCP server as failed."""
     method = msg.get("method")
     params = msg.get("params") or {}
     if method == "initialize":
         result = {"protocolVersion": params.get("protocolVersion", "2024-11-05"),
                   "capabilities": {"tools": {}},
                   "serverInfo": {"name": "word-bridge", "version": "1.0.0"},
-                  "instructions": "Word 桥接：隧道暂时不通，工具调用会返回说明。"}
+                  "instructions": "Word bridge: the tunnel is down for now; tool calls will return an explanation."}
     elif method == "ping":
         result = {}
     elif method == "tools/list":
@@ -267,7 +267,7 @@ def main():
         expect_reply = "id" in msg and "method" in msg
         params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
         if msg.get("method") == "tools/call" and params.get("name") == "word_replace_image":
-            # 图片在这台机器上：先在本地读取并处理成 PNG，再随调用一起发给 Mac
+            # The image is on this machine: read it and turn it into a PNG here, then send it to the Mac with the call
             try:
                 prepare_image(params.setdefault("arguments", {}))
                 line = json.dumps(msg, ensure_ascii=False)

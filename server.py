@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Word 桥接服务（Mac 端）。
+"""Word bridge server (Mac side).
 
-让远程的 Claude 通过 MCP 工具，在本机 Word 里已打开的文档上做带修订痕迹的修改。
+Lets a remote Claude make tracked edits, through MCP tools, in documents that are open in Word on this Mac.
 
-- 监听一个仅本人可访问的 Unix 套接字，连接后先校验口令，再走 MCP（按行分隔的 JSON-RPC）。
-- 只允许操作 config.json 里列出的文档；只做修订模式的修改和批注；
-  从不保存、关闭文档，也从不接受或拒绝修订。
-- 所有写操作记入 audit.log。
-- 另有一个后台线程负责维持到远程主机的 SSH 反向隧道：只复用已登录的主连接，
-  主连接断开时什么也不做，绝不自己发起登录。
+- Listens on a Unix socket only this user can reach; a connection presents the token first, then speaks MCP (newline-delimited JSON-RPC).
+- Only documents listed in config.json can be touched, and only tracked edits and comments are made;
+  it never saves or closes a document, and never accepts or rejects a revision.
+- Every write is recorded in audit.log.
+- A background thread keeps the SSH reverse tunnel to the remote host alive. It only reuses the master connection
+  you already opened, does nothing when that is gone, and never tries to log in by itself.
 
-只依赖 Python 标准库。
+Standard library only.
 """
 import base64
 import contextlib
@@ -38,17 +38,17 @@ MAX_IMAGE_BYTES = 120 * 1024 * 1024
 KNOWN_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 
 INSTRUCTIONS = (
-    "这些工具直接操作用户 Mac 上 Word 里【已经打开】的文档，改动会立刻出现在用户眼前的窗口里。\n"
-    "规则：\n"
-    "1. 所有修改都以修订模式写入，由用户逐条接受或拒绝；你不能保存、关闭文档，也不能接受/拒绝修订。\n"
-    "2. 修改前先用 word_read_document 或 word_find_text 读取【当前】内容——用户可能刚改过，"
-    "不要依赖磁盘上的 docx 或你记忆里的旧文本。\n"
-    "3. find/anchor 必须与文档里的文字逐字符一致，并且只出现一次；出现多次时加长上下文使其唯一，"
-    "或用 occurrence 指定第几处。尽量选不跨段落、不含引文域（如 Zotero 引用）的片段。\n"
-    "4. 每次只改需要改的那一小段，不要整段重写，这样修订痕迹才清楚。\n"
-    "5. 图片只能整张替换（word_list_images 查看、word_replace_image 替换），默认使用 900 dpi 的 PNG；"
-    "表格结构和版式调整不在这些工具的能力范围内，需要时请告诉用户。\n"
-    "6. 读到的文本不包含已被修订删除的文字（即“接受全部修订后”的样子）。"
+    "These tools act directly on documents that are ALREADY OPEN in Word on the user's Mac; every change shows up at once in the window the user is looking at.\n"
+    "Rules:\n"
+    "1. Every edit is written as a tracked change for the user to accept or reject. You cannot save or close a document, or accept or reject revisions.\n"
+    "2. Before editing, read the CURRENT content with word_read_document or word_find_text. The user may have just changed it, "
+    "so do not rely on the .docx on disk or on text you remember.\n"
+    "3. find/anchor text must match the document character for character and occur exactly once. If it occurs more than once, add context to make it unique, "
+    "or pick one with occurrence. Prefer snippets that stay within one paragraph and contain no citation fields (such as Zotero citations).\n"
+    "4. Change only the small piece that needs changing instead of rewriting whole paragraphs, so the tracked changes stay readable.\n"
+    "5. Pictures can only be replaced whole (word_list_images to look, word_replace_image to replace), by default with a 900 dpi PNG; "
+    "table structure and layout are beyond these tools, so tell the user when those are needed.\n"
+    "6. Text you read does not include tracked deletions: it is the document as it would be after accepting all changes."
 )
 
 word_lock = threading.Lock()
@@ -79,63 +79,67 @@ def load_token():
 
 
 class ToolError(Exception):
-    pass
+    """An error to report back to the model. code is the Word script's error code, when there is one."""
+
+    def __init__(self, message, code=None):
+        super().__init__(message)
+        self.code = code
 
 
-# ---------------------------------------------------------------- Word 调用
+# ---------------------------------------------------------------- Calling Word
 
 def run_word(*args, timeout=150):
-    """调用 word_ops.applescript，返回去掉 OK 之后的原始字符串。"""
+    """Run word_ops.applescript and return the raw string that follows the leading OK."""
     with word_lock:
         try:
-            # 用字节模式读取：Word 的段落标记是 \r，文本模式会把它悄悄换成 \n
+            # Read as bytes: Word's paragraph mark is \r, and text mode would silently turn it into \n
             proc = subprocess.run(
                 ["/usr/bin/osascript", SCRIPT_PATH, *[str(a) for a in args]],
                 capture_output=True, timeout=timeout,
             )
         except subprocess.TimeoutExpired:
-            raise ToolError("Word 在限定时间内没有响应（可能正弹着对话框，或文档很大）。")
+            raise ToolError("Word did not respond in time (it may be showing a dialog, or the document is very large).")
     out = proc.stdout.decode("utf-8", errors="replace")
     if out.endswith("\n"):
         out = out[:-1]
     if proc.returncode != 0 and not out:
-        raise ToolError("调用 Word 失败：" + proc.stderr.decode("utf-8", errors="replace").strip()[:300])
+        raise ToolError("Could not call Word: " + proc.stderr.decode("utf-8", errors="replace").strip()[:300])
     head, _, rest = out.partition(US)
     if head == "OK":
         return rest
     code, _, detail = rest.partition(US)
-    raise ToolError(explain_error(code, detail))
+    raise ToolError(explain_error(code, detail), code)
 
 
 def explain_error(code, detail):
     if code == "not_open":
-        return "这份文档目前没有在 Word 里打开。请用户先打开它。"
+        return "This document is not open in Word right now. Ask the user to open it first."
     if code == "notfound":
-        return ("在文档当前内容里找不到这段文字（需要逐字符一致，包括空格和标点）。"
-                "请先用 word_find_text 或 word_read_document 核对当前文本。")
+        return ("This text was not found in the document's current content (it must match character for character, including spaces and punctuation). "
+                "Check the current text with word_find_text or word_read_document first.")
     if code == "ambiguous":
-        return (f"这段文字在文档里出现了 {detail} 次，无法确定改哪一处。"
-                "请加长片段使其唯一，或用 occurrence 指定第几处（从 1 开始）。")
+        return (f"This text occurs {detail} times in the document, so it is unclear which one to change. "
+                "Add context to make it unique, or use occurrence to pick one (counting from 1).")
     if code == "badocc":
-        return f"occurrence 超出范围：这段文字只出现了 {detail} 次。"
+        return f"occurrence is out of range: this text occurs only {detail} times."
     if code == "verify_failed":
-        return ("定位后复核不一致，为安全起见没有做任何修改。"
-                "这通常是因为片段里夹着引文域、脚注标记或已有的修订。请换一段不含这些内容的文字作为定位依据。"
-                f"（该位置实际读到：{detail[:80]!r}）")
+        return ("The text read back at the located position did not match, so nothing was changed. "
+                "This usually means the snippet contains a citation field, a footnote mark or an existing revision. Use a nearby snippet without those as the anchor. "
+                f"(Read at that position: {detail[:80]!r})")
     if code == "badindex":
-        return f"图片序号超出范围：文档里只有 {detail} 张嵌入式图片。先用 word_list_images 查看。"
+        return f"Picture index out of range: the document has only {detail} inline pictures. Check with word_list_images first."
     if code == "stale":
-        return "文档里的图片位置在这期间发生了变化，为安全起见没有替换。请重新调用 word_list_images 后再试。"
+        return "The pictures in the document moved in the meantime, so nothing was replaced. Call word_list_images again and retry."
     if code == "image_failed":
         stage, _, msg = detail.partition(US)
-        hint = {"start": "没有做任何修改。", "inserted": "新图已插入但尺寸未调整、旧图未删除，请用户检查该处。",
-                "resized": "新图已插入并调整尺寸，但旧图未删除，请用户检查该处。"}.get(stage, "")
-        return f"替换图片时 Word 报错（阶段 {stage}）：{msg[:300]} {hint}"
+        hint = {"start": "Nothing was changed.", "inserted": "The new picture was inserted, but it was not resized and the old one was not deleted; ask the user to check that spot.",
+                "resized": "The new picture was inserted and resized, but the old one was not deleted; ask the user to check that spot."}.get(stage, "")
+        return f"Word reported an error while replacing the picture (stage {stage}): {msg[:300]} {hint}"
     if code == "write_failed":
-        return "Word 拒绝了这次写入：" + detail[:300]
+        return "Word refused this write: " + detail[:300]
     if code == "exception":
-        return "Word 脚本出错：" + detail[:300]
-    return f"未知错误 {code}: {detail[:200]}"
+        return "The Word script failed: " + detail[:300]
+    return f"Unknown error {code}: {detail[:200]}"
 
 
 def check_doc(name):
@@ -143,13 +147,13 @@ def check_doc(name):
     allowed = cfg.get("allowed_documents", [])
     if name not in allowed:
         raise ToolError(
-            f"文档 {name!r} 不在允许列表里。允许的文档：{', '.join(allowed)}。"
-            "需要增加时请让用户修改 Mac 上的 ~/.word-bridge/config.json。")
+            f"Document {name!r} is not on the allow-list. Allowed documents: {', '.join(allowed)}. "
+            "To add one, ask the user to edit ~/.word-bridge/config.json on the Mac.")
     return cfg
 
 
 def to_word(text):
-    """调用方的换行统一成 Word 的段落标记。"""
+    """Turn the caller's line breaks into Word paragraph marks."""
     return text.replace("\r\n", "\r").replace("\n", "\r")
 
 
@@ -158,7 +162,7 @@ def is_word_char(ch):
 
 
 def tight_diff(old, new):
-    """去掉 old/new 的公共前后缀，让修订只覆盖真正变化的部分；不在英文单词或数字中间下刀。"""
+    """Strip the common prefix and suffix of old and new so the revision covers only what changed; never cut inside an English word or a number."""
     limit = min(len(old), len(new))
     i = 0
     while i < limit and old[i] == new[i]:
@@ -198,16 +202,16 @@ def paragraphs_of(text):
     return paras
 
 
-# ---------------------------------------------------------------- 工具实现
+# ---------------------------------------------------------------- Tools
 
 def tool_list_documents(args):
     cfg = load_config()
     allowed = cfg.get("allowed_documents", [])
     rest = run_word("list")
     opened = [n for n in rest.split(RS) if n]
-    lines = ["允许操作的文档及其状态："]
+    lines = ["Allowed documents and their state:"]
     for name in allowed:
-        lines.append(f"- {name}：{'已在 Word 中打开' if name in opened else '未打开'}")
+        lines.append(f"- {name}: {'open in Word' if name in opened else 'not open'}")
     return "\n".join(lines)
 
 
@@ -219,11 +223,11 @@ def tool_read_document(args):
     info = read_doc(name)
     paras = paragraphs_of(info["text"])
     chunk = paras[start - 1:start - 1 + count]
-    head = (f"文档 {name}：共 {len(paras)} 段，待处理修订 {info['revisions']} 处，批注 {info['comments']} 条，"
-            f"{'已保存' if info['saved'] else '有未保存的修改'}。"
-            f"以下是第 {start}–{start + len(chunk) - 1} 段（不含已被修订删除的文字）：")
+    head = (f"Document {name}: {len(paras)} paragraphs, {info['revisions']} pending revisions, {info['comments']} comments, "
+            f"{'saved' if info['saved'] else 'has unsaved changes'}. "
+            f"Paragraphs {start}–{start + len(chunk) - 1} follow (tracked deletions are not included):")
     body = "\n".join(f"[{start + i}] {p}" for i, p in enumerate(chunk))
-    tail = "" if start - 1 + count >= len(paras) else f"\n……后面还有 {len(paras) - (start - 1 + count)} 段，用 start_paragraph 继续读。"
+    tail = "" if start - 1 + count >= len(paras) else f"\n… {len(paras) - (start - 1 + count)} more paragraphs follow; continue with start_paragraph."
     return head + "\n" + body + tail
 
 
@@ -232,7 +236,7 @@ def tool_find_text(args):
     check_doc(name)
     query = to_word(args["query"])
     if not query:
-        raise ToolError("query 不能为空。")
+        raise ToolError("query must not be empty.")
     ctx = max(0, min(300, int(args.get("context_chars", 60))))
     max_results = max(1, min(50, int(args.get("max_results", 20))))
     text = read_doc(name)["text"]
@@ -241,15 +245,15 @@ def tool_find_text(args):
         hits.append(pos)
         pos = text.find(query, pos + len(query))
     if not hits:
-        return f"在 {name} 的当前内容里没有找到这段文字。"
-    lines = [f"在 {name} 中找到 {len(hits)} 处："]
+        return f"This text was not found in the current content of {name}."
+    lines = [f"Found {len(hits)} occurrence(s) in {name}:"]
     for idx, pos in enumerate(hits[:max_results], 1):
         para_no = text.count("\r", 0, pos) + 1
         before = text[max(0, pos - ctx):pos].replace("\r", "⏎")
         after = text[pos + len(query):pos + len(query) + ctx].replace("\r", "⏎")
-        lines.append(f"{idx}. 第 {para_no} 段：…{before}【{query.replace(chr(13), '⏎')}】{after}…")
+        lines.append(f"{idx}. paragraph {para_no}: …{before}«{query.replace(chr(13), '⏎')}»{after}…")
     if len(hits) > max_results:
-        lines.append(f"（只显示前 {max_results} 处）")
+        lines.append(f"(showing the first {max_results} only)")
     return "\n".join(lines)
 
 
@@ -268,21 +272,21 @@ def tool_replace_text(args):
     replace = to_word(args.get("replace", ""))
     occurrence = max(0, int(args.get("occurrence", 0)))
     if not find:
-        raise ToolError("find 不能为空。要插入文字请用 word_insert_text。")
+        raise ToolError("find must not be empty. Use word_insert_text to insert text.")
     if find == replace:
-        raise ToolError("find 和 replace 完全相同，没有需要修改的内容。")
+        raise ToolError("find and replace are identical, so there is nothing to change.")
     prefix, middle_old, middle_new = tight_diff(find, replace)
     try:
         n_rev = do_edit(name, find, prefix, middle_old, middle_new, occurrence, cfg, "replace_text")
     except ToolError as exc:
-        # 精简后的区间复核失败时，退回到整段替换再试一次
-        if "复核不一致" not in str(exc) or (prefix == "" and middle_old == find):
+        # If verification fails on the tightened range, fall back once to replacing the whole match
+        if exc.code != "verify_failed" or (prefix == "" and middle_old == find):
             raise
         n_rev = do_edit(name, find, "", find, replace, occurrence, cfg, "replace_text")
         middle_old, middle_new = find, replace
-    what = "删除" if middle_new == "" else ("插入" if middle_old == "" else "替换")
-    return (f"已以修订模式{what}。删除：{middle_old!r}；插入：{middle_new!r}。"
-            f"文档现有 {n_rev} 处待处理修订，等用户审阅。")
+    what = "Deleted" if middle_new == "" else ("Inserted" if middle_old == "" else "Replaced")
+    return (f"{what} as a tracked change. Deleted: {middle_old!r}; inserted: {middle_new!r}. "
+            f"The document now has {n_rev} pending revisions for the user to review.")
 
 
 def tool_insert_text(args):
@@ -293,13 +297,13 @@ def tool_insert_text(args):
     where = args.get("position", "after")
     occurrence = max(0, int(args.get("occurrence", 0)))
     if not anchor or not text:
-        raise ToolError("anchor 和 text 都不能为空。")
+        raise ToolError("anchor and text must not be empty.")
     if where not in ("after", "before"):
-        raise ToolError("position 只能是 after 或 before。")
+        raise ToolError("position must be after or before.")
     prefix = anchor if where == "after" else ""
     n_rev = do_edit(name, anchor, prefix, "", text, occurrence, cfg, "insert_text")
-    return (f"已以修订模式在定位文字{'之后' if where == 'after' else '之前'}插入：{text!r}。"
-            f"文档现有 {n_rev} 处待处理修订。")
+    return (f"Inserted as a tracked change {'after' if where == 'after' else 'before'} the anchor text: {text!r}. "
+            f"The document now has {n_rev} pending revisions.")
 
 
 def tool_add_comment(args):
@@ -309,11 +313,11 @@ def tool_add_comment(args):
     comment = args["comment"]
     occurrence = max(0, int(args.get("occurrence", 0)))
     if not anchor or not comment:
-        raise ToolError("anchor 和 comment 都不能为空。")
+        raise ToolError("anchor and comment must not be empty.")
     rest = run_word("comment", name, anchor, occurrence, comment, cfg.get("author", "Claude"))
     _, n_com = rest.split(US)
     audit({"tool": "add_comment", "document": name, "anchor": anchor, "comment": comment, "occurrence": occurrence})
-    return f"已在该文字上添加批注。文档现有 {n_com} 条批注。"
+    return f"Comment added on that text. The document now has {n_com} comments."
 
 
 def tool_list_changes(args):
@@ -324,23 +328,23 @@ def tool_list_changes(args):
     head, _, body = rest.partition(RS)
     n_rev, n_com = head.split(US)
     rev_part, _, com_part = body.partition(GS)
-    kinds = {"revision insert": "插入", "revision delete": "删除"}
-    lines = [f"文档 {name}：待处理修订 {n_rev} 处，批注 {n_com} 条。"]
+    kinds = {"revision insert": "inserted", "revision delete": "deleted"}
+    lines = [f"Document {name}: {n_rev} pending revisions, {n_com} comments."]
     if rev_part:
-        lines.append("修订：")
+        lines.append("Revisions:")
         for i, row in enumerate(rev_part.split(RS), 1):
             kind, author, text = (row.split(US) + ["", "", ""])[:3]
-            lines.append(f"{i}. [{kinds.get(kind, kind)}] {author}：{text.replace(chr(13), '⏎')[:200]}")
+            lines.append(f"{i}. [{kinds.get(kind, kind)}] {author}: {text.replace(chr(13), '⏎')[:200]}")
     if com_part:
-        lines.append("批注：")
+        lines.append("Comments:")
         for i, row in enumerate(com_part.split(RS), 1):
             author, scope, text = (row.split(US) + ["", "", ""])[:3]
-            lines.append(f"{i}. {author} 批注于“{scope.replace(chr(13), '⏎')[:60]}”：{text.replace(chr(13), ' ')[:300]}")
+            lines.append(f"{i}. {author} on “{scope.replace(chr(13), '⏎')[:60]}”: {text.replace(chr(13), ' ')[:300]}")
     return "\n".join(lines)
 
 
 def png_info(data):
-    """从 PNG 字节里读出 (宽, 高, dpi)；dpi 没有记录时为 None。不是 PNG 时返回 None。"""
+    """Read (width, height, dpi) from PNG bytes; dpi is None when it is not recorded. Returns None when the data is not a PNG."""
     if data[:8] != b"\x89PNG\r\n\x1a\n":
         return None
     width = height = dpi = None
@@ -360,7 +364,7 @@ def png_info(data):
 
 
 class _OneImageHandler(http.server.BaseHTTPRequestHandler):
-    """只应答一个带随机口令的路径，把内存里的那张图片交给 Word。"""
+    """Answer exactly one path, which carries a random token, and hand Word the image held in memory."""
 
     def _answer(self, with_body):
         if self.path != self.server.image_path:
@@ -385,11 +389,11 @@ class _OneImageHandler(http.server.BaseHTTPRequestHandler):
 
 @contextlib.contextmanager
 def serve_image(data):
-    """在调用期间，通过只监听本机回环地址的临时端口把图片提供给 Word。
+    """For the duration of one call, serve the image to Word from a temporary port on the loopback interface.
 
-    Word 是沙盒应用，不能随意读取磁盘上的文件，而本服务也无权写入 Word 自己的目录；
-    让 Word 从 127.0.0.1 取图可以绕开这两头的文件权限问题，且不需要用户额外授权。
-    路径里带一次性的随机口令，调用结束即关闭。
+    Word is sandboxed and cannot read arbitrary files, and this server may not write into Word's own container;
+    letting Word fetch the image from 127.0.0.1 avoids file permissions on both sides and needs no extra consent.
+    The path carries a one-time random token, and the listener is closed as soon as the call returns.
     """
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _OneImageHandler)
     server.image_path = "/" + secrets.token_urlsafe(24) + "/image.png"
@@ -427,15 +431,15 @@ def tool_list_images(args):
     name = args["document"]
     check_doc(name)
     n_inline, n_floating, images = list_images(name)
-    lines = [f"文档 {name}：嵌入式图片 {n_inline} 张" + (f"，另有浮动图片 {n_floating} 张（不支持替换）" if n_floating else "") + "。"]
+    lines = [f"Document {name}: {n_inline} inline pictures" + (f", plus {n_floating} floating pictures (cannot be replaced)" if n_floating else "") + "."]
     for img in images:
-        state = "（已被修订删除，等用户接受）" if img["deleted"] else ""
+        state = " (tracked-deleted, waiting for the user to accept)" if img["deleted"] else ""
         above = clean_context(img["above"])[-70:]
         below = clean_context(img["below"]).lstrip("/⏎ ")[:110]
-        lines.append(f"#{img['index']}{state} 显示尺寸 {img['width_cm']:.2f} × {img['height_cm']:.2f} cm\n"
-                     f"    上方文字：…{above}\n    下方文字：{below}…")
+        lines.append(f"#{img['index']}{state} displayed at {img['width_cm']:.2f} × {img['height_cm']:.2f} cm\n"
+                     f"    text above: …{above}\n    text below: {below}…")
     if images:
-        lines.append("图片序号会随替换而变化，每次替换前请重新查看。")
+        lines.append("Picture indexes change after a replacement; list them again before each one.")
     return "\n".join(lines)
 
 
@@ -444,16 +448,16 @@ def tool_replace_image(args):
     cfg = check_doc(name)
     data_b64 = args.get("image_data")
     if not data_b64:
-        raise ToolError("这次调用没有附带图片数据。图片由远程端的 client.py 读取并随调用发送，请确认远程主机上的 client.py 是最新版本。")
+        raise ToolError("This call carried no image data. The image is read by client.py on the remote side and sent with the call; make sure client.py on the remote host is up to date.")
     try:
         data = base64.b64decode(data_b64, validate=True)
     except (ValueError, TypeError):
-        raise ToolError("图片数据损坏，无法解码。")
+        raise ToolError("The image data is corrupt and could not be decoded.")
     if len(data) > MAX_IMAGE_BYTES:
-        raise ToolError(f"图片太大（{len(data) / 1e6:.0f} MB），上限 {MAX_IMAGE_BYTES // (1024 * 1024)} MB。")
+        raise ToolError(f"The image is too large ({len(data) / 1e6:.0f} MB); the limit is {MAX_IMAGE_BYTES // (1024 * 1024)} MB.")
     info = png_info(data)
     if info is None:
-        raise ToolError("收到的不是 PNG 图片。请提供 PNG，或提供 PDF 由远程端渲染成 PNG。")
+        raise ToolError("The data received is not a PNG. Provide a PNG, or a PDF for the remote side to render to PNG.")
     px_w, px_h, dpi = info
 
     n_inline, _, images = list_images(name)
@@ -461,17 +465,17 @@ def tool_replace_image(args):
     index = int(args.get("image_index") or 0)
     near = to_word(args.get("near_text") or "")
     if index and near:
-        raise ToolError("image_index 和 near_text 只能给一个。")
+        raise ToolError("Give either image_index or near_text, not both.")
     if index:
         target = next((img for img in images if img["index"] == index), None)
         if target is None:
-            raise ToolError(f"图片序号超出范围：文档里只有 {n_inline} 张嵌入式图片。")
+            raise ToolError(f"Picture index out of range: the document has only {n_inline} inline pictures.")
         if target["deleted"]:
-            raise ToolError("这张图片已经被修订删除（等用户接受），不能再替换。请用 word_list_images 确认要换的是哪一张。")
+            raise ToolError("This picture is already tracked-deleted (waiting for the user to accept) and cannot be replaced again. Use word_list_images to confirm which one you mean.")
     elif near:
         side = args.get("side", "above")
         if side not in ("above", "below"):
-            raise ToolError("side 只能是 above（图片在定位文字上方）或 below（图片在定位文字下方）。")
+            raise ToolError("side must be above (the picture is above the anchor text) or below (the picture is below it).")
         rest = run_word("locate", name, near, max(0, int(args.get("occurrence", 0))))
         anchor_pos = int(rest.split(US)[1])
         if side == "above":
@@ -481,9 +485,9 @@ def tool_replace_image(args):
             candidates = [img for img in live if img["start"] >= anchor_pos]
             target = min(candidates, key=lambda img: img["start"]) if candidates else None
         if target is None:
-            raise ToolError(f"在定位文字{'上方' if side == 'above' else '下方'}没有找到图片。请用 word_list_images 查看图片位置。")
+            raise ToolError(f"No picture was found {'above' if side == 'above' else 'below'} the anchor text. Use word_list_images to see where the pictures are.")
     else:
-        raise ToolError("需要用 image_index 或 near_text 指明替换哪一张图片。")
+        raise ToolError("Say which picture to replace with image_index or near_text.")
 
     with serve_image(data) as url:
         rest = run_word("replaceimage", name, target["index"], target["start"], url, cfg.get("author", "Claude"), timeout=240)
@@ -492,100 +496,100 @@ def tool_replace_image(args):
            "source": args.get("image_path"), "bytes": len(data), "pixels": [px_w, px_h], "dpi": dpi})
     note = args.get("image_note") or ""
     below = clean_context(target["below"]).lstrip("/⏎ ")[:60]
-    return (f"已以修订模式替换第 {target['index']} 张图片（其下方文字：{below}…）。\n"
-            f"新图：{px_w} × {px_h} 像素，{str(dpi) + ' dpi' if dpi else '未记录 dpi'}。{note}\n"
-            f"显示尺寸：{pt_to_cm(old_w):.2f} × {pt_to_cm(old_h):.2f} cm → {pt_to_cm(new_w):.2f} × {pt_to_cm(new_h):.2f} cm（宽度沿用原图，高度按新图比例）。\n"
-            f"旧图以“删除”修订保留，用户接受后才会消失。文档现有 {n_rev} 处待处理修订。\n"
-            "提醒用户：如果这份文档没有关闭图片压缩，Word 保存时会把图片降到约 220 ppi。"
-            "要保留原始分辨率，需在 Word 的 偏好设置 → 编辑 → 图像大小和质量 中勾选“不压缩文件中的图像”。")
+    return (f"Replaced picture #{target['index']} as a tracked change (text below it: {below}…).\n"
+            f"New image: {px_w} × {px_h} pixels, {str(dpi) + ' dpi' if dpi else 'no dpi recorded'}. {note}\n"
+            f"Displayed size: {pt_to_cm(old_w):.2f} × {pt_to_cm(old_h):.2f} cm → {pt_to_cm(new_w):.2f} × {pt_to_cm(new_h):.2f} cm (width kept from the old picture, height from the new image's proportions).\n"
+            f"The old picture stays as a tracked deletion until the user accepts it. The document now has {n_rev} pending revisions.\n"
+            "Tell the user: unless picture compression is turned off for this document, Word downsamples pictures to about 220 ppi when it saves. "
+            "To keep the full resolution, tick “Do not compress images in file” under Word > Preferences > Edit > Image Size and Quality.")
 
 
-DOC_PROP = {"type": "string", "description": "文档文件名，例如 report.docx。先用 word_list_documents 查看可用的文档。"}
-OCC_PROP = {"type": "integer", "description": "定位文字出现多次时，指定改第几处（从 1 开始）。省略或 0 表示必须唯一。", "default": 0}
+DOC_PROP = {"type": "string", "description": "Document file name, for example report.docx. Use word_list_documents to see which documents are available."}
+OCC_PROP = {"type": "integer", "description": "When the anchor text occurs more than once, which occurrence to use (counting from 1). Omit or 0 to require it to be unique.", "default": 0}
 
 TOOLS = [
     {"name": "word_list_documents",
-     "description": "列出允许操作的 Word 文档，以及它们此刻是否已在用户的 Word 里打开。",
+     "description": "List the Word documents that may be edited, and whether each is open in the user's Word right now.",
      "inputSchema": {"type": "object", "properties": {}},
      "handler": tool_list_documents},
     {"name": "word_read_document",
-     "description": "读取用户 Word 里已打开文档的【当前】内容（包含用户尚未保存的修改），按段落编号返回。修改前先读。",
+     "description": "Read the CURRENT content of a document open in the user's Word (including edits the user has not saved), as numbered paragraphs. Read before you edit.",
      "inputSchema": {"type": "object", "properties": {
          "document": DOC_PROP,
-         "start_paragraph": {"type": "integer", "description": "从第几段开始，默认 1。", "default": 1},
-         "max_paragraphs": {"type": "integer", "description": "最多返回多少段，默认 40，上限 200。", "default": 40}},
+         "start_paragraph": {"type": "integer", "description": "First paragraph to return; default 1.", "default": 1},
+         "max_paragraphs": {"type": "integer", "description": "Maximum number of paragraphs to return; default 40, at most 200.", "default": 40}},
          "required": ["document"]},
      "handler": tool_read_document},
     {"name": "word_find_text",
-     "description": "在已打开文档的当前内容里查找一段文字，返回每处所在段落和上下文。用来确认定位文字是否唯一、逐字符是否一致。",
+     "description": "Find a piece of text in the current content of an open document and return the paragraph and context of each occurrence. Use it to check that an anchor is unique and matches character for character.",
      "inputSchema": {"type": "object", "properties": {
          "document": DOC_PROP,
-         "query": {"type": "string", "description": "要查找的文字（区分大小写，逐字符匹配）。"},
-         "context_chars": {"type": "integer", "description": "每处前后显示多少字符，默认 60。", "default": 60},
-         "max_results": {"type": "integer", "description": "最多显示多少处，默认 20。", "default": 20}},
+         "query": {"type": "string", "description": "Text to find (case-sensitive, matched character for character)."},
+         "context_chars": {"type": "integer", "description": "Characters of context to show on each side; default 60.", "default": 60},
+         "max_results": {"type": "integer", "description": "Maximum number of occurrences to show; default 20.", "default": 20}},
          "required": ["document", "query"]},
      "handler": tool_find_text},
     {"name": "word_replace_text",
-     "description": ("以修订模式把一段文字替换成另一段，改动立刻显示在用户打开的 Word 窗口里。"
-                     "replace 为空字符串即删除。find 必须与文档逐字符一致且唯一（或用 occurrence 指定）。"
-                     "只会把 find 与 replace 之间真正不同的部分标为修订。"),
+     "description": ("Replace a piece of text with another as a tracked change; it shows up at once in the Word window the user has open. "
+                     "An empty replace deletes the text. find must match the document character for character and be unique (or be picked with occurrence). "
+                     "Only the part that actually differs between find and replace is marked as a revision."),
      "inputSchema": {"type": "object", "properties": {
          "document": DOC_PROP,
-         "find": {"type": "string", "description": "文档里现有的文字，带足够上下文以保证唯一。"},
-         "replace": {"type": "string", "description": "替换后的文字。空字符串表示删除。"},
+         "find": {"type": "string", "description": "Existing text in the document, with enough context to be unique."},
+         "replace": {"type": "string", "description": "The replacement text. An empty string deletes."},
          "occurrence": OCC_PROP},
          "required": ["document", "find", "replace"]},
      "handler": tool_replace_text},
     {"name": "word_insert_text",
-     "description": "以修订模式在一段定位文字之后（或之前）插入新文字。要另起一段时在 text 里用换行符。",
+     "description": "Insert new text after (or before) an anchor text, as a tracked change. Use a line break in text to start a new paragraph.",
      "inputSchema": {"type": "object", "properties": {
          "document": DOC_PROP,
-         "anchor": {"type": "string", "description": "文档里现有的、用来定位的文字（逐字符一致且唯一）。"},
-         "text": {"type": "string", "description": "要插入的文字。"},
-         "position": {"type": "string", "enum": ["after", "before"], "description": "插在定位文字之后还是之前，默认 after。", "default": "after"},
+         "anchor": {"type": "string", "description": "Existing text in the document used as the anchor (matching character for character, and unique)."},
+         "text": {"type": "string", "description": "The text to insert."},
+         "position": {"type": "string", "enum": ["after", "before"], "description": "Insert after or before the anchor; default after.", "default": "after"},
          "occurrence": OCC_PROP},
          "required": ["document", "anchor", "text"]},
      "handler": tool_insert_text},
     {"name": "word_add_comment",
-     "description": "在一段文字上添加 Word 批注（不改正文）。适合提出疑问、说明修改理由。",
+     "description": "Attach a Word comment to a piece of text without changing the text. Good for questions and for explaining an edit.",
      "inputSchema": {"type": "object", "properties": {
          "document": DOC_PROP,
-         "anchor": {"type": "string", "description": "批注要挂在哪段现有文字上（逐字符一致且唯一）。"},
-         "comment": {"type": "string", "description": "批注内容。"},
+         "anchor": {"type": "string", "description": "The existing text to attach the comment to (matching character for character, and unique)."},
+         "comment": {"type": "string", "description": "The comment text."},
          "occurrence": OCC_PROP},
          "required": ["document", "anchor", "comment"]},
      "handler": tool_add_comment},
     {"name": "word_list_images",
-     "description": "列出文档里的嵌入式图片：序号、显示尺寸、上方和下方的文字（通常下方就是图注）。替换图片前先用它确认是哪一张。",
+     "description": "List the inline pictures in the document: index, displayed size, and the text above and below each (the text below is usually the caption). Use it before replacing a picture to confirm which one.",
      "inputSchema": {"type": "object", "properties": {"document": DOC_PROP}, "required": ["document"]},
      "handler": tool_list_images},
     {"name": "word_replace_image",
-     "description": ("以修订模式把文档里的一张图片整张替换成新图：新图沿用原图的显示宽度，高度按新图比例调整。"
-                     "image_path 是【你所在这台机器上】的文件路径，由本地客户端读取后发送。"
-                     "默认使用 900 dpi 的 PNG：给 PDF 时会渲染成 900 dpi 的 PNG；给的 PNG 分辨率不足而旁边有同名 PDF 时，"
-                     "改用该 PDF 渲染。用 near_text（通常是图注开头的文字）或 image_index 指明替换哪一张。"),
+     "description": ("Replace one picture in the document with a new image as a tracked change: the new picture keeps the old one's displayed width, and its height follows the new image's proportions. "
+                     "image_path is a file path ON THE MACHINE YOU ARE RUNNING ON; the local client reads the file and sends it. "
+                     "The default is a 900 dpi PNG: a PDF is rendered to a 900 dpi PNG, and a PNG below that resolution is swapped for a PDF of the same name next to it, "
+                     "if there is one. Say which picture with near_text (usually the start of its caption) or image_index."),
      "inputSchema": {"type": "object", "properties": {
          "document": DOC_PROP,
-         "image_path": {"type": "string", "description": "新图片在你这台机器上的路径，PNG 或 PDF。"},
-         "near_text": {"type": "string", "description": "图片旁边的一段现有文字（逐字符一致且唯一），通常取图注开头。"},
-         "side": {"type": "string", "enum": ["above", "below"], "description": "图片在 near_text 的上方还是下方，默认 above（图在图注上方）。", "default": "above"},
-         "image_index": {"type": "integer", "description": "word_list_images 给出的图片序号。与 near_text 二选一。"},
+         "image_path": {"type": "string", "description": "Path of the new image on your machine, PNG or PDF."},
+         "near_text": {"type": "string", "description": "A piece of existing text next to the picture (matching character for character, and unique), usually the start of its caption."},
+         "side": {"type": "string", "enum": ["above", "below"], "description": "Whether the picture is above or below near_text; default above (figure above its caption).", "default": "above"},
+         "image_index": {"type": "integer", "description": "The picture index given by word_list_images. Use either this or near_text."},
          "occurrence": OCC_PROP,
-         "dpi": {"type": "integer", "description": "目标分辨率，默认 900。", "default": 900}},
+         "dpi": {"type": "integer", "description": "Target resolution; default 900.", "default": 900}},
          "required": ["document", "image_path"]},
      "handler": tool_replace_image},
     {"name": "word_list_changes",
-     "description": "列出文档里尚未处理的修订（谁、插入还是删除、内容）和批注，用来了解哪些改动还在等用户审阅。",
+     "description": "List the pending revisions in the document (who, inserted or deleted, the text) and the comments, to see which changes still await the user's review.",
      "inputSchema": {"type": "object", "properties": {
          "document": DOC_PROP,
-         "max_items": {"type": "integer", "description": "最多列出多少条，默认 100。", "default": 100}},
+         "max_items": {"type": "integer", "description": "Maximum number of items to list; default 100.", "default": 100}},
          "required": ["document"]},
      "handler": tool_list_changes},
 ]
 TOOL_INDEX = {t["name"]: t for t in TOOLS}
 
 
-# ---------------------------------------------------------------- MCP 协议
+# ---------------------------------------------------------------- MCP protocol
 
 def handle_request(msg):
     method = msg.get("method")
@@ -607,14 +611,14 @@ def handle_request(msg):
         try:
             for key in tool["inputSchema"].get("required", []):
                 if key not in args:
-                    raise ToolError(f"缺少必填参数 {key}。")
+                    raise ToolError(f"Required argument {key} is missing.")
             text = tool["handler"](args)
             return {"content": [{"type": "text", "text": text}], "isError": False}
         except ToolError as exc:
             return {"content": [{"type": "text", "text": str(exc)}], "isError": True}
-        except Exception as exc:  # 不让单次调用的意外拖垮连接
+        except Exception as exc:  # do not let one failed call take the connection down
             log(f"tool {params.get('name')} crashed: {exc!r}")
-            return {"content": [{"type": "text", "text": f"桥接服务内部错误：{exc}"}], "isError": True}
+            return {"content": [{"type": "text", "text": f"Internal error in the bridge server: {exc}"}], "isError": True}
     raise LookupError("method not found")
 
 
@@ -639,7 +643,7 @@ def serve_connection(conn, token):
             if not isinstance(msg, dict) or "method" not in msg:
                 continue
             if "id" not in msg:
-                continue  # 通知，不需要回复
+                continue  # a notification; no reply needed
             try:
                 reply = {"jsonrpc": "2.0", "id": msg["id"], "result": handle_request(msg)}
             except LookupError as exc:
@@ -655,10 +659,10 @@ def serve_connection(conn, token):
             pass
 
 
-# ---------------------------------------------------------------- SSH 隧道维护
+# ---------------------------------------------------------------- SSH tunnel upkeep
 
 def ssh_base(control_path):
-    # 只走已有的主连接；主连接不在时在本地立即失败，绝不向远程主机发起认证。
+    # Only ride the existing master connection; fail locally at once when it is gone, and never authenticate to the remote host.
     return ["/usr/bin/ssh", "-F", "/dev/null", "-S", control_path,
             "-o", "ControlMaster=no", "-o", "BatchMode=yes",
             "-o", "ProxyCommand=/bin/sh -c 'exit 1'", "word-bridge-tunnel"]
@@ -709,7 +713,7 @@ def tunnel_keeper():
         time.sleep(30)
 
 
-# ---------------------------------------------------------------- 入口
+# ---------------------------------------------------------------- Entry point
 
 def main():
     os.umask(0o077)
