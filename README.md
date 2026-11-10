@@ -4,6 +4,10 @@ Let a Claude Code session on a remote machine make **tracked edits in a Word doc
 
 [中文说明](README.zh-CN.md)
 
+![A Claude Code session on the remote host, and the same document in Word on the Mac a moment later](docs/demo.png)
+
+*Top: a Claude Code session on the remote host, rendered from the transcript of a real run and abridged. Bottom: a screenshot of the document open in Word on the Mac, with the tracked changes, the replaced figure and the comments that run produced.*
+
 ## Why this exists
 
 If you write in Word on a Mac while an AI agent works on a remote server, the obvious approach is to sync the `.docx` file. That does not work well:

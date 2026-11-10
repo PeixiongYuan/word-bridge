@@ -4,6 +4,10 @@
 
 [English](README.md)
 
+![远程主机上的 Claude Code 对话，以及片刻之后 Mac 上 Word 里的同一份文档](docs/demo.png)
+
+*上：远程主机上的 Claude Code 对话，根据一次真实运行的记录排版，有删节。下：Mac 上 Word 窗口的截图，显示这次运行产生的修订、被替换的图片和批注。*
+
 ## 为什么做这个
 
 在 Mac 上用 Word 写稿、同时让远程服务器上的 AI 帮忙改，最直接的想法是同步 `.docx` 文件。但这条路走不通：
