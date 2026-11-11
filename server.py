@@ -16,10 +16,12 @@ Standard library only.
 import base64
 import contextlib
 import difflib
+import hashlib
 import hmac
 import http.server
 import json
 import os
+import re
 import secrets
 import socket
 import struct
@@ -30,6 +32,8 @@ import time
 import unicodedata
 import urllib.parse
 
+import equation
+
 BASE = os.environ.get("WORD_BRIDGE_HOME") or os.path.expanduser("~/.word-bridge")
 CONFIG_PATH = os.path.join(BASE, "config.json")
 TOKEN_PATH = os.path.join(BASE, "token")
@@ -37,7 +41,7 @@ AUDIT_PATH = os.path.join(BASE, "audit.log")
 SCRIPT_PATH = os.path.join(BASE, "word_ops.applescript")
 
 US, RS, GS = "\x1f", "\x1e", "\x1d"
-SERVER_INFO = {"name": "word-bridge", "version": "1.4.0"}
+SERVER_INFO = {"name": "word-bridge", "version": "1.5.0"}
 MAX_IMAGE_BYTES = 120 * 1024 * 1024
 KNOWN_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 
@@ -59,7 +63,14 @@ INSTRUCTIONS = (
     "and the citation stays intact; an edit that would rewrite or delete a field is refused unless you pass allow_field_changes. "
     "A citation shows up in the text as its number or label, for example the 3,4 in 'levels3,4.'; keep it unchanged in replace.\n"
     "8. Every write is checked by reading the document back, and the result shows the passage as it now reads. "
-    "If a result carries a WARNING, stop editing that document and tell the user."
+    "If a result carries a WARNING, stop editing that document and tell the user.\n"
+    "9. Equations: word_insert_equation writes a real Word equation from LaTeX, inline or as a display equation in a paragraph of its own. "
+    "Write the surrounding sentence first with word_insert_text, then place each equation after or before normal text. "
+    "In text you read, an equation shows up as ⟦…⟧ with its layout flattened (a fraction a over b reads ⟦a b⟧); "
+    "in a document with many equations they are not grouped, and each reads as short fragments, often in mathematical italic letters, on lines of their own. "
+    "Never use an equation's text or the brackets as find or anchor, and do not edit inside it. "
+    "To correct an equation, remove it with word_delete_equation and insert a new one. "
+    "The read-back cannot show whether a formula looks right, so tell the user which formula you put where."
 )
 
 word_lock = threading.Lock()
@@ -150,6 +161,39 @@ def explain_error(code, detail):
                 "To change the field's own text on purpose, call word_replace_text with allow_field_changes=true.")
     if code == "field_in_range":
         return FIELD_REFUSAL
+    if code == "in_equation":
+        return ("This spot is inside an equation, so nothing was changed: these tools do not write into an equation. "
+                "Use normal text outside it. To change the equation itself, remove it with word_delete_equation and insert a corrected one with word_insert_equation.")
+    if code == "after_equation":
+        return ("This spot is at the very end of an equation and is not followed by normal text (a paragraph mark, a field, a picture or a tracked deletion comes next), "
+                "so Word would make the new content part of the equation. Nothing was changed. "
+                "Pick an anchor that leaves at least one character of normal text between the equation and the new content, or tell the user.")
+    if code == "equation_in_range":
+        return ("The text to be changed includes an equation or part of one, so nothing was changed: rewriting it would turn the equation into plain characters. "
+                "Change the text before and after the equation in separate calls, with find text that stops short of it. "
+                "To remove or replace the equation itself, use word_delete_equation and word_insert_equation.")
+    if code == "near_equation":
+        where = {"in": "inside another equation", "end": "directly behind another equation",
+                 "start": "directly in front of another equation"}.get(detail, "next to another equation")
+        return (f"This spot is {where} (possibly one whose deletion still waits for the user's review), and Word would merge the two into one equation. "
+                "Nothing was changed. Pick an anchor so that at least one character of normal text lies between the two, or insert that text first with word_insert_text.")
+    if code == "equation_unbuilt":
+        cleaned, _, read = detail.partition(US)
+        state = ("It was taken out again, so the document is unchanged." if cleaned == "1" else
+                 "WARNING: it could not be taken out again cleanly. Stop editing this document and tell the user to check that spot.")
+        hint = ' It looks like LaTeX: pass it with format="latex".' if "\\" in read else ""
+        return (f"Word could not build this formula; part of it stayed raw text: {flat_equation(read)[:200]} {state}{hint} "
+                "Check that brackets are balanced and the syntax is right, or write the formula in a simpler form.")
+    if code == "equation_failed":
+        stage, _, tail = detail.partition(US)
+        cleaned, _, msg = tail.partition(US)
+        state = ("Nothing was left in the document." if cleaned == "1" else
+                 "WARNING: what was written could not be taken out again cleanly. Stop editing this document and tell the user to check that spot.")
+        return f"Word reported an error while creating the equation (stage {stage}): {msg[:300]} {state}"
+    if code == "no_equation":
+        return ("There is no equation directly on that side of the anchor text (only spaces and one or two paragraph marks may lie between them), or it is already deleted. "
+                "Read the passage with word_read_document, where equations show up as ⟦…⟧. "
+                "Use the normal text right before the equation with position after, or the text right after it with position before.")
     if code == "bad_segments":
         return "Internal error: the parts of this edit overlap. Nothing was changed."
     if code == "badindex":
@@ -328,16 +372,77 @@ def tight_diff(old, new):
     return old[:i], old[i:len(old) - j], new[i:len(new) - j]
 
 
+# word_ops.applescript wraps the text of each equation in these two characters
+EQ_OPEN, EQ_CLOSE = "\x11", "\x12"
+EQUATION_AS_ANCHOR = (
+    "Text inside ⟦ ⟧ is an equation shown in flattened form, and the brackets are not in the document, so it cannot be used as {}. "
+    "Use normal text next to the equation instead. To change an equation, remove it with word_delete_equation and insert a new one with word_insert_equation.")
+
+
+# Marking the equations costs Word four requests each, so it is done for documents with at most this many,
+# and the result is kept for as long as the document's text stays the same.
+EQUATION_MARK_LIMIT = 40
+marked_cache = {}
+
+
 def read_doc(name):
+    """The document's state and text. In a document with few enough equations, each one's text is wrapped in EQ_OPEN and EQ_CLOSE."""
     rest = run_word("read", name)
-    tracking, n_rev, n_com, saved, text = rest.split(US, 4)
+    tracking, n_rev, n_com, saved, n_math, n_marked, text = rest.split(US, 6)
+    if 0 < int(n_math) <= EQUATION_MARK_LIMIT:
+        digest = hashlib.sha1(text.encode("utf-8", "surrogatepass")).hexdigest()
+        cached = marked_cache.get(name)
+        if cached and cached[0] == digest:
+            n_marked, text = cached[1], cached[2]
+        else:
+            rest = run_word("read", name, EQUATION_MARK_LIMIT)
+            tracking, n_rev, n_com, saved, n_math, n_marked, text = rest.split(US, 6)
+            plain = text.replace(EQ_OPEN, "").replace(EQ_CLOSE, "")
+            marked_cache[name] = (hashlib.sha1(plain.encode("utf-8", "surrogatepass")).hexdigest(), n_marked, text)
     return {
         "tracking": tracking == "true",
         "revisions": int(n_rev),
         "comments": int(n_com),
         "saved": saved == "true",
+        "equations": int(n_math),
+        "equations_marked": int(n_marked),
         "text": text,
     }
+
+
+def show_equations(text):
+    """The text with every equation made readable: ⟦ ⟧ around it, and the paragraph marks Word reports at its structure boundaries turned into spaces.
+    Same length as text, so a position in one is a position in the other."""
+    out, inside = [], False
+    for ch in text:
+        if ch == EQ_OPEN:
+            inside = True
+            out.append("⟦")
+        elif ch == EQ_CLOSE:
+            inside = False
+            out.append("⟧")
+        elif inside and ch == "\r":
+            out.append(" ")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def tidy_equations(text):
+    """Collapse the runs of spaces inside ⟦ ⟧."""
+    return re.sub(r"⟦([^⟧]*)⟧", lambda m: "⟦" + " ".join(m.group(1).split()) + "⟧", text)
+
+
+def flat_equation(raw):
+    """One equation's text the way it is shown to the model."""
+    return "⟦" + " ".join(raw.replace("\r", " ").split()) + "⟧"
+
+
+def plain_only(text, what):
+    """Refuse find or anchor text copied from the ⟦ ⟧ display of an equation."""
+    if "⟦" in text or "⟧" in text:
+        raise ToolError(EQUATION_AS_ANCHOR.format(what))
+    return text
 
 
 def paragraphs_of(text):
@@ -370,10 +475,17 @@ def tool_read_document(args):
     start = max(1, int(args.get("start_paragraph", 1)))
     count = max(1, min(200, int(args.get("max_paragraphs", 40))))
     info = read_doc(spec)
-    paras = paragraphs_of(info["text"])
+    paras = paragraphs_of(tidy_equations(show_equations(info["text"])))
     chunk = paras[start - 1:start - 1 + count]
+    equations = ""
+    if info["equations_marked"]:
+        equations = (f"It has {info['equations']} equation(s), shown as ⟦…⟧ with the layout flattened; "
+                     "do not use that text or the brackets as find or anchor. ")
+    elif info["equations"]:
+        equations = (f"It has {info['equations']} equations. They are not grouped here: each reads as short fragments on lines of their own "
+                     "(the paragraph numbers count those lines too). Do not use such fragments as find or anchor. ")
     head = (f"Document {name}: {len(paras)} paragraphs, {info['revisions']} pending revisions, {info['comments']} comments, "
-            f"{'saved' if info['saved'] else 'has unsaved changes'}. "
+            f"{'saved' if info['saved'] else 'has unsaved changes'}. {equations}"
             f"Paragraphs {start}–{start + len(chunk) - 1} follow (tracked deletions are not included):")
     body = "\n".join(f"[{start + i}] {p}" for i, p in enumerate(chunk))
     tail = "" if start - 1 + count >= len(paras) else f"\n… {len(paras) - (start - 1 + count)} more paragraphs follow; continue with start_paragraph."
@@ -383,12 +495,13 @@ def tool_read_document(args):
 def tool_find_text(args):
     name = args["document"]
     _, spec = check_doc(name)
-    query = to_word(args["query"])
+    query = plain_only(to_word(args["query"]), "a query")
     if not query:
         raise ToolError("query must not be empty.")
     ctx = max(0, min(300, int(args.get("context_chars", 60))))
     max_results = max(1, min(50, int(args.get("max_results", 20))))
     text = read_doc(spec)["text"]
+    shown = show_equations(text)
     hits, pos = [], text.find(query)
     while pos != -1:
         hits.append(pos)
@@ -397,10 +510,11 @@ def tool_find_text(args):
         return f"This text was not found in the current content of {name}."
     lines = [f"Found {len(hits)} occurrence(s) in {name}:"]
     for idx, pos in enumerate(hits[:max_results], 1):
-        para_no = text.count("\r", 0, pos) + 1
-        before = text[max(0, pos - ctx):pos].replace("\r", "⏎")
-        after = text[pos + len(query):pos + len(query) + ctx].replace("\r", "⏎")
-        lines.append(f"{idx}. paragraph {para_no}: …{before}«{query.replace(chr(13), '⏎')}»{after}…")
+        para_no = shown.count("\r", 0, pos) + 1
+        before = shown[max(0, pos - ctx):pos].replace("\r", "⏎")
+        after = shown[pos + len(query):pos + len(query) + ctx].replace("\r", "⏎")
+        inside = " (inside an equation, where text cannot be edited)" if text.rfind(EQ_OPEN, 0, pos) > text.rfind(EQ_CLOSE, 0, pos) else ""
+        lines.append(f"{idx}. paragraph {para_no}{inside}: …{before}«{shown[pos:pos + len(query)].replace(chr(13), '⏎')}»{after}…")
     if len(hits) > max_results:
         lines.append(f"(showing the first {max_results} only)")
     return "\n".join(lines)
@@ -495,8 +609,8 @@ def readback_note(res, new_text):
 def tool_replace_text(args):
     name = args["document"]
     cfg, spec = check_doc(name)
-    find = to_word(args["find"])
-    replace = to_word(args.get("replace", ""))
+    find = plain_only(to_word(args["find"]), "find text")
+    replace = plain_only(to_word(args.get("replace", "")), "replacement text")
     occurrence = max(0, int(args.get("occurrence", 0)))
     allow_fields = bool(args.get("allow_field_changes", False))
     if not find:
@@ -527,8 +641,8 @@ def tool_replace_text(args):
 def tool_insert_text(args):
     name = args["document"]
     cfg, spec = check_doc(name)
-    anchor = to_word(args["anchor"])
-    text = to_word(args["text"])
+    anchor = plain_only(to_word(args["anchor"]), "an anchor")
+    text = plain_only(to_word(args["text"]), "text to insert")
     where = args.get("position", "after")
     occurrence = max(0, int(args.get("occurrence", 0)))
     if not anchor or not text:
@@ -545,7 +659,7 @@ def tool_insert_text(args):
 def tool_add_comment(args):
     name = args["document"]
     cfg, spec = check_doc(name)
-    anchor = to_word(args["anchor"])
+    anchor = plain_only(to_word(args["anchor"]), "an anchor")
     comment = args["comment"]
     occurrence = max(0, int(args.get("occurrence", 0)))
     if not anchor or not comment:
@@ -704,7 +818,7 @@ def image_from_call(args):
 def tool_insert_image(args):
     name = args["document"]
     cfg, spec = check_doc(name)
-    anchor = to_word(args.get("anchor") or "")
+    anchor = plain_only(to_word(args.get("anchor") or ""), "an anchor")
     where = args.get("position", "before")
     occurrence = max(0, int(args.get("occurrence", 0)))
     own_paragraph = bool(args.get("own_paragraph", True))
@@ -751,7 +865,7 @@ def tool_replace_image(args):
     n_inline, _, images = list_images(spec)
     live = [img for img in images if not img["deleted"]]
     index = int(args.get("image_index") or 0)
-    near = to_word(args.get("near_text") or "")
+    near = plain_only(to_word(args.get("near_text") or ""), "near_text")
     if index and near:
         raise ToolError("Give either image_index or near_text, not both.")
     if index:
@@ -789,6 +903,81 @@ def tool_replace_image(args):
             f"Displayed size: {pt_to_cm(old_w):.2f} × {pt_to_cm(old_h):.2f} cm → {pt_to_cm(new_w):.2f} × {pt_to_cm(new_h):.2f} cm (width kept from the old picture, height from the new image's proportions).\n"
             f"The old picture stays as a tracked deletion until the user accepts it. The document now has {n_rev} pending revisions.\n"
             + COMPRESSION_NOTE)
+
+
+def tool_insert_equation(args):
+    name = args["document"]
+    cfg, spec = check_doc(name)
+    source = (args.get("equation") or "").strip()
+    fmt = args.get("format", "latex")
+    anchor = plain_only(to_word(args.get("anchor") or ""), "an anchor")
+    where = args.get("position", "after")
+    occurrence = max(0, int(args.get("occurrence", 0)))
+    own_paragraph = bool(args.get("own_paragraph", False))
+    if not source:
+        raise ToolError("equation must not be empty.")
+    if not anchor:
+        raise ToolError("anchor must not be empty: give a piece of existing normal text next to where the equation should go.")
+    if where not in ("after", "before"):
+        raise ToolError("position must be after or before.")
+    if fmt not in ("latex", "unicodemath"):
+        raise ToolError('format must be "latex" or "unicodemath".')
+    try:
+        linear = equation.latex_to_unicodemath(source) if fmt == "latex" else equation.check_unicodemath(source)
+    except equation.MathError as exc:
+        raise ToolError(f"The formula could not be converted, so nothing was changed. {exc}")
+    # Characters that only stay in an equation's text when Word failed to build part of it
+    unbuilt = equation.LEFTOVER_CHARS + "\\" + "".join(ch for ch in '"^_' if "\\" + ch not in linear)
+    rest = run_word("insertequation", spec, anchor, occurrence, where, linear, cfg.get("author", "Claude"),
+                    "1" if own_paragraph else "0", unbuilt)
+    n_math, n_rev, post, n_lead, n_trail, eq_read, ctx_a, ctx_b = rest.split(US, 7)
+    audit({"tool": "insert_equation", "document": name, "location": spec.partition(GS)[2], "anchor": anchor, "where": where,
+           "format": fmt, "source": source, "linear": linear, "own_paragraph": own_paragraph, "verified": post == "ok"})
+    placing = "in a paragraph of its own, as a display equation" if own_paragraph else "inline with the text"
+    if post == "ok":
+        check = (f"Verified by reading the document back. The passage now reads: "
+                 f"…{visible(ctx_a)}{'⏎' * int(n_lead)}{flat_equation(eq_read)}{'⏎' * int(n_trail)}{visible(ctx_b)}…")
+    elif post == "merged":
+        check = ("WARNING: the equation was written, but the number of equations in the document did not go up by one, "
+                 "so it may have merged with a neighbouring equation. Stop editing this document and tell the user to check that spot.")
+    else:
+        check = ("WARNING: the equation was inserted, but when the document was read back its text did not match what this insertion should have produced. "
+                 "It may have landed in the wrong place, or the user may have been typing at the same moment. "
+                 "Stop editing this document and tell the user.")
+    return (f"Inserted an equation as a tracked change {where} the anchor text, {placing}.\n"
+            f"Word built it from this linear form: {linear}\n"
+            f"{check}\n"
+            f"The document now has {n_rev} pending revisions and {n_math} equation(s). "
+            "The read-back shows where the equation is, not how it looks: tell the user which formula you inserted there.")
+
+
+def tool_delete_equation(args):
+    name = args["document"]
+    cfg, spec = check_doc(name)
+    anchor = plain_only(to_word(args.get("anchor") or ""), "an anchor")
+    where = args.get("position", "after")
+    occurrence = max(0, int(args.get("occurrence", 0)))
+    if not anchor:
+        raise ToolError("anchor must not be empty: give the normal text right before the equation (position after) or right after it (position before).")
+    if where not in ("after", "before"):
+        raise ToolError("position must be after or before.")
+    rest = run_word("deleteequation", spec, anchor, occurrence, where, cfg.get("author", "Claude"))
+    n_before, n_after, n_rev, post, drop_mark, eq_read, ctx_a, ctx_b = rest.split(US, 7)
+    audit({"tool": "delete_equation", "document": name, "location": spec.partition(GS)[2], "anchor": anchor, "where": where,
+           "equation_text": eq_read, "verified": post == "ok"})
+    if int(n_after) < int(n_before):
+        how = "It was a pending insertion by the same author, so it is gone without leaving a revision."
+    else:
+        how = ("It stays in the document as a tracked deletion until the user accepts it. Until then a new equation cannot go in exactly that spot, "
+               "only with some normal text in between.")
+    mark = " Its paragraph mark went with it, since the equation filled the paragraph." if drop_mark == "1" else ""
+    if post == "ok":
+        check = f"Verified by reading the document back. The passage now reads: …{visible(ctx_a)}«»{visible(ctx_b)}…"
+    else:
+        check = ("WARNING: the equation was deleted, but when the document was read back its text did not match what this deletion should have produced. "
+                 "Stop editing this document and tell the user.")
+    return (f"Deleted the equation {flat_equation(eq_read)} {where} the anchor text.{mark} {how}\n{check}\n"
+            f"The document now has {n_rev} pending revisions.")
 
 
 DOC_PROP = {"type": "string", "description": "Document file name, for example report.docx. Use word_list_documents to see which documents are available."}
@@ -871,6 +1060,37 @@ TOOLS = [
          "dpi": {"type": "integer", "description": "Target resolution; default 900.", "default": 900}},
          "required": ["document", "image_path", "anchor"]},
      "handler": tool_insert_image},
+    {"name": "word_insert_equation",
+     "description": ("Insert a real Word equation (an equation object, not a picture and not plain characters) next to an anchor text, as a tracked change. "
+                     "Write the formula in LaTeX, as one formula without $ signs. Supported: fractions, roots, sub- and superscripts, sums, products and integrals with limits, "
+                     "Greek letters and the usual symbols, accents, \\text, \\mathrm, \\mathbf, \\mathbb, \\mathcal, functions such as \\log and \\operatorname, "
+                     "\\left and \\right, matrices, cases and aligned. Anything else is refused with a message instead of being guessed. "
+                     "By default the equation sits inline in the sentence; own_paragraph=true makes it a centred display equation in a paragraph of its own. "
+                     "Write the surrounding sentence first with word_insert_text, then put each equation after or before normal text; "
+                     "an equation cannot go directly next to another equation. No spaces are added around it, so leave the ones you want in the text. "
+                     "Equation numbers are not added. "
+                     "For a formula that LaTeX mode refuses, format=\"unicodemath\" takes Word's own linear format, for example (a+b)/(c+d) or ∑_(i=1)^n▒x_i."),
+     "inputSchema": {"type": "object", "properties": {
+         "document": DOC_PROP,
+         "equation": {"type": "string", "description": "The formula, in LaTeX by default, for example \\hat{\\beta} = \\frac{\\mathrm{Cov}(x, y)}{\\mathrm{Var}(x)}."},
+         "anchor": {"type": "string", "description": "A piece of existing normal text next to where the equation should go (matching character for character, and unique)."},
+         "position": {"type": "string", "enum": ["after", "before"], "description": "Put the equation after or before the anchor; default after.", "default": "after"},
+         "occurrence": OCC_PROP,
+         "own_paragraph": {"type": "boolean", "description": "Give the equation a paragraph of its own, as a display equation (default false: inline).", "default": False},
+         "format": {"type": "string", "enum": ["latex", "unicodemath"], "description": "How equation is written; default latex.", "default": "latex"}},
+         "required": ["document", "equation", "anchor"]},
+     "handler": tool_insert_equation},
+    {"name": "word_delete_equation",
+     "description": ("Delete the equation that directly follows (or precedes) an anchor text, as a tracked change. Use it to remove a wrong equation before inserting a corrected one "
+                     "with word_insert_equation. The anchor is normal text next to the equation; for an equation in a paragraph of its own, "
+                     "use the end of the paragraph above it with position after, or the start of the paragraph below it with position before."),
+     "inputSchema": {"type": "object", "properties": {
+         "document": DOC_PROP,
+         "anchor": {"type": "string", "description": "Normal text right next to the equation (matching character for character, and unique)."},
+         "position": {"type": "string", "enum": ["after", "before"], "description": "Whether the equation comes after or before the anchor; default after.", "default": "after"},
+         "occurrence": OCC_PROP},
+         "required": ["document", "anchor"]},
+     "handler": tool_delete_equation},
     {"name": "word_replace_image",
      "description": ("Replace one picture in the document with a new image as a tracked change: the new picture keeps the old one's displayed width, and its height follows the new image's proportions. "
                      "image_path is a file path ON THE MACHINE YOU ARE RUNNING ON; the local client reads the file and sends it. "

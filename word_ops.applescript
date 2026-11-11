@@ -176,6 +176,107 @@ on fieldDetails(d, pS, a, b)
 	return my joinList(outRows, my recSep)
 end fieldDetails
 
+-- Number of equations that [a,b) touches
+on countMath(d, a, b)
+	if b ≤ a then return 0
+	tell application "Microsoft Word"
+		return count of math objects of (create range d start a end b)
+	end tell
+end countMath
+
+-- How position x sits relative to the equations: "in" (inside one), "end" (right behind the last character of one),
+-- "start" (right in front of one) or "" (clear of them). Text written at "in" or "end" becomes part of that equation.
+on mathSide(d, x, docEnd)
+	set mathLeft to false
+	set mathRight to false
+	if x > 0 then set mathLeft to ((my countMath(d, x - 1, x)) > 0)
+	if x < docEnd then set mathRight to ((my countMath(d, x, x + 1)) > 0)
+	if mathLeft and mathRight then return "in"
+	if mathLeft then return "end"
+	if mathRight then return "start"
+	return ""
+end mathSide
+
+-- The range {start, end} of the equation that holds position x, or {-1, -1}
+on equationAt(d, x)
+	tell application "Microsoft Word"
+		set nMath to count of math objects of d
+	end tell
+	repeat with i from 1 to nMath
+		tell application "Microsoft Word"
+			set eqRange to text range of (math object i of d)
+			set a to start of content of eqRange
+			set b to end of content of eqRange
+		end tell
+		if a ≤ x and x < b then return {a, b}
+	end repeat
+	return {-1, -1}
+end equationAt
+
+-- Wrap the text of every equation in t between ASCII 17 and ASCII 18, so that the caller can tell it from normal text.
+-- Returns {number of equations marked, the text}; when anything does not add up, the text comes back unchanged.
+-- Each request to Word takes several milliseconds and an equation needs four, so the caller limits how many equations it asks for.
+on markEquations(d, t, nMath, docEnd)
+	set tLen to count of t
+	set spanStarts to {}
+	set spanLens to {}
+	set nBefore to 0
+	set prevA to 0
+	repeat with i from 1 to nMath
+		tell application "Microsoft Word"
+			set eqRange to text range of (math object i of d)
+			set a to start of content of eqRange
+			set b to end of content of eqRange
+		end tell
+		if a < prevA then return {0, t}
+		-- Counted from the start of the previous equation, a position that is never inside a field code
+		set nBefore to nBefore + (my vis(d, prevA, a))
+		set eqText to my readRange(d, a, b)
+		set nInside to count of eqText
+		if nInside > 0 then
+			if (nBefore + nInside) > tLen then return {0, t}
+			if not (my textsEqual(text (nBefore + 1) thru (nBefore + nInside) of t, eqText)) then return {0, t}
+			set end of spanStarts to nBefore
+			set end of spanLens to nInside
+		end if
+		set prevA to a
+	end repeat
+	if (nBefore + (my vis(d, prevA, docEnd))) is not tLen then return {0, t}
+	set outText to t
+	repeat with j from (count of spanStarts) to 1 by -1
+		set nBefore to item j of spanStarts
+		set nInside to item j of spanLens
+		set headText to ""
+		if nBefore > 0 then set headText to text 1 thru nBefore of outText
+		set midText to text (nBefore + 1) thru (nBefore + nInside) of outText
+		set tailText to ""
+		if (nBefore + nInside) < (count of outText) then set tailText to text (nBefore + nInside + 1) thru -1 of outText
+		set outText to headText & (character id 17) & midText & (character id 18) & tailText
+	end repeat
+	return {(count of spanStarts), outText}
+end markEquations
+
+-- The error to report when the text read back at the located place is not the anchor text:
+-- inside an equation the cause is the equation's structure, which these tools do not edit.
+on anchorMismatch(d, a, b, got)
+	set inMath to false
+	try
+		set inMath to ((my countMath(d, a, b)) > 0)
+	end try
+	if inMath then return "ERR" & my fieldSep & "in_equation"
+	return "ERR" & my fieldSep & "verify_failed" & my fieldSep & got
+end anchorMismatch
+
+-- True when s holds any of the characters of charSet
+on hasAnyOf(s, charSet)
+	considering case, diacriticals, hyphens, punctuation and white space
+		repeat with ch in (characters of charSet)
+			if s contains (contents of ch) then return true
+		end repeat
+	end considering
+	return false
+end hasAnyOf
+
 -- Where to insert between two visible characters of the located text [pS,pE): prefixText is the part of findText in front of the point.
 -- Checks the text on both sides, then picks a position outside every field.
 -- Returns {status, position, detail}; status is "ok", "verify_failed" or "in_field".
@@ -329,8 +430,16 @@ on run argv
 					set nr to count of revisions of d
 					set nc to count of Word comments of d
 					set sv to saved of d
+					set nMath to count of math objects of d
+					set docEnd to end of content of text object of d
 				end tell
-				return "OK" & my fieldSep & (tr as text) & my fieldSep & nr & my fieldSep & nc & my fieldSep & (sv as text) & my fieldSep & t
+				-- argv: read doc [markLimit]. An equation reads as its characters with a paragraph mark at every structure boundary.
+				-- With a markLimit, and no more equations than that, each equation's text is marked for the caller.
+				set nMarked to 0
+				set markLimit to 0
+				if (count of argv) > 2 then set markLimit to (item 3 of argv) as integer
+				if nMath > 0 and nMath ≤ markLimit then set {nMarked, t} to my markEquations(d, t, nMath, docEnd)
+				return "OK" & my fieldSep & (tr as text) & my fieldSep & nr & my fieldSep & nc & my fieldSep & (sv as text) & my fieldSep & nMath & my fieldSep & nMarked & my fieldSep & t
 
 			else if op is "edit" then
 				-- argv: edit doc findText occurrence author allowFields expectAfter nSeg  then, per segment: prefixText oldText newText
@@ -348,11 +457,15 @@ on run argv
 				set pS to my posForVisible(d, k, docEnd, excess)
 				set pE to my endForVisible(d, pS, findLen, docEnd)
 				set got to my readRange(d, pS, pE)
-				if not (my textsEqual(got, findText)) then return "ERR" & my fieldSep & "verify_failed" & my fieldSep & got
+				if not (my textsEqual(got, findText)) then return my anchorMismatch(d, pS, pE, got)
 				set nFields to my countFields(d, 0, docEnd)
+				tell application "Microsoft Word"
+					set nMath to count of math objects of d
+				end tell
 				set segStarts to {}
 				set segEnds to {}
 				set segTexts to {}
+				set segNearMath to {}
 				set lastQ to -1
 				repeat with i from 1 to nSeg
 					set prefixText to item (9 + (i - 1) * 3) of argv
@@ -400,29 +513,67 @@ on run argv
 								if not (allowFields and dP is dQ and (my countFields(d, p, q)) is 0) then return "ERR" & my fieldSep & "in_field" & my fieldSep & got
 							end if
 						end if
+						set nearMath to false
+						if nMath > 0 then
+							-- Rewriting text that belongs to an equation would turn the equation into plain characters
+							if (my countMath(d, p, q)) > 0 then return "ERR" & my fieldSep & "equation_in_range" & my fieldSep & got
+							set nearMath to ((my mathSide(d, p, docEnd)) is not "")
+						end if
 					else
 						-- Pure insertion between two visible characters
 						set {insStatus, p, insDetail} to my insertionPoint(d, pS, pE, findText, prefixText, docEnd, nFields, allowFields)
 						if insStatus is not "ok" then return "ERR" & my fieldSep & insStatus & my fieldSep & insDetail
 						set q to p
+						set nearMath to false
+						if nMath > 0 then
+							set mSide to my mathSide(d, p, docEnd)
+							if mSide is "in" then return "ERR" & my fieldSep & "in_equation"
+							if mSide is "end" then
+								-- Text written at the end of an equation joins it. Rewrite the next character instead: what replaces normal text stays normal text.
+								set nextLen to 1
+								set nextChar to my readRange(d, p, p + 1)
+								if nextChar is not "" then
+									if (id of nextChar) ≥ 55296 and (id of nextChar) ≤ 56319 then
+										set nextLen to 2
+										set nextChar to my readRange(d, p, p + 2)
+									end if
+								end if
+								if nextChar is "" then return "ERR" & my fieldSep & "after_equation"
+								if (count of nextChar) is not 1 then return "ERR" & my fieldSep & "after_equation"
+								if (id of nextChar) < 32 then return "ERR" & my fieldSep & "after_equation"
+								if (my countMath(d, p, p + nextLen)) > 0 then return "ERR" & my fieldSep & "in_equation"
+								if nFields > 0 then
+									if (my fieldDepth(d, p, docEnd, nFields)) > 0 or (my fieldDepth(d, p + nextLen, docEnd, nFields)) > 0 then return "ERR" & my fieldSep & "after_equation"
+								end if
+								set q to p + nextLen
+								set newText to newText & nextChar
+							end if
+							set nearMath to (mSide is not "")
+						end if
 					end if
 					if p < lastQ then return "ERR" & my fieldSep & "bad_segments" & my fieldSep & i
 					set lastQ to q
 					set end of segStarts to p
 					set end of segEnds to q
 					set end of segTexts to newText
+					set end of segNearMath to nearMath
 				end repeat
 				-- Write from the last segment to the first, so earlier positions stay valid
 				tell application "Microsoft Word"
 					set oldName to user name
 					set track revisions of d to true
 					set nDone to 0
+					set mathLeak to false
 					try
 						if authorName is not "" then set user name to authorName
 						repeat with i from nSeg to 1 by -1
 							set r to create range d start (item i of segStarts) end (item i of segEnds)
 							set content of r to (item i of segTexts)
 							set nDone to nDone + 1
+							-- Next to an equation: what was just written must not have become part of it
+							if (item i of segNearMath) and (item i of segTexts) is not "" then
+								if (count of math objects of (create range d start (item i of segStarts) end ((item i of segStarts) + 1))) > 0 then set mathLeak to true
+							end if
 						end repeat
 						set user name to oldName
 					on error errMsg
@@ -439,6 +590,7 @@ on run argv
 				if (k + findLen) < (count of t) then set tailText to text (k + findLen + 1) thru -1 of t
 				set postStatus to "ok"
 				if not (my textsEqual(t2, headText & expectAfter & tailText)) then set postStatus to "mismatch"
+				if mathLeak then set postStatus to "mismatch"
 				set ctxA to ""
 				if k > 0 then
 					set ctxFrom to k - 59
@@ -471,7 +623,7 @@ on run argv
 					set got to content of (create range d start p end q)
 				end tell
 				if got is missing value then set got to ""
-				if not (my textsEqual(got, findText)) then return "ERR" & my fieldSep & "verify_failed" & my fieldSep & got
+				if not (my textsEqual(got, findText)) then return my anchorMismatch(d, p, q, got)
 				tell application "Microsoft Word"
 					set oldName to user name
 					try
@@ -520,7 +672,7 @@ on run argv
 				set p to my posForVisible(d, k, docEnd, excess)
 				set q to my endForVisible(d, p, (count of findText), docEnd)
 				set got to my readRange(d, p, q)
-				if not (my textsEqual(got, findText)) then return "ERR" & my fieldSep & "verify_failed" & my fieldSep & got
+				if not (my textsEqual(got, findText)) then return my anchorMismatch(d, p, q, got)
 				return "OK" & my fieldSep & n & my fieldSep & p & my fieldSep & q
 
 			else if op is "images" then
@@ -579,12 +731,15 @@ on run argv
 				set pS to my posForVisible(d, k, docEnd, excess)
 				set pE to my endForVisible(d, pS, findLen, docEnd)
 				set got to my readRange(d, pS, pE)
-				if not (my textsEqual(got, findText)) then return "ERR" & my fieldSep & "verify_failed" & my fieldSep & got
+				if not (my textsEqual(got, findText)) then return my anchorMismatch(d, pS, pE, got)
 				set nFields to my countFields(d, 0, docEnd)
 				set prefixText to ""
 				if placeWhere is "after" then set prefixText to findText
 				set {insStatus, p, insDetail} to my insertionPoint(d, pS, pE, findText, prefixText, docEnd, nFields, false)
 				if insStatus is not "ok" then return "ERR" & my fieldSep & insStatus & my fieldSep & insDetail
+				set mSide to my mathSide(d, p, docEnd)
+				if mSide is "in" then return "ERR" & my fieldSep & "in_equation"
+				if mSide is "end" then return "ERR" & my fieldSep & "after_equation"
 				-- kIns visible characters come before the insertion point
 				set kIns to k + (count of prefixText)
 				set tLen to count of t
@@ -680,6 +835,204 @@ on run argv
 				set ctxB to tailText
 				if (count of tailText) > 60 then set ctxB to text 1 thru 60 of tailText
 				return "OK" & my fieldSep & shpIndex & my fieldSep & (natW as text) & my fieldSep & (natH as text) & my fieldSep & (newW as text) & my fieldSep & (newH as text) & my fieldSep & nRev & my fieldSep & postStatus & my fieldSep & (count of leadMark) & my fieldSep & (count of trailMark) & my fieldSep & ctxA & my fieldSep & ctxB
+
+			else if op is "insertequation" then
+				-- argv: insertequation doc anchorText occurrence where(before|after) linearText author ownParagraph(1|0) unbuiltChars
+				-- Write the formula in Word's linear format before or after the anchor text, turn that text into an equation and build it up; all tracked.
+				-- unbuiltChars only remain in an equation's text when Word could not build it; the insertion is then taken out again.
+				set findText to item 3 of argv
+				set occ to (item 4 of argv) as integer
+				set placeWhere to item 5 of argv
+				set eqText to item 6 of argv
+				set authorName to item 7 of argv
+				set ownPara to ((item 8 of argv) is "1")
+				set unbuiltChars to item 9 of argv
+				set {locStatus, n, k, t, docEnd, excess} to my locateVisible(d, findText, occ)
+				if locStatus is not "ok" then return "ERR" & my fieldSep & locStatus & my fieldSep & n
+				set findLen to count of findText
+				set pS to my posForVisible(d, k, docEnd, excess)
+				set pE to my endForVisible(d, pS, findLen, docEnd)
+				set got to my readRange(d, pS, pE)
+				if not (my textsEqual(got, findText)) then return my anchorMismatch(d, pS, pE, got)
+				set nFields to my countFields(d, 0, docEnd)
+				set prefixText to ""
+				if placeWhere is "after" then set prefixText to findText
+				set {insStatus, p, insDetail} to my insertionPoint(d, pS, pE, findText, prefixText, docEnd, nFields, false)
+				if insStatus is not "ok" then return "ERR" & my fieldSep & insStatus & my fieldSep & insDetail
+				-- An equation written right next to another one would merge with it
+				set mSide to my mathSide(d, p, docEnd)
+				if mSide is not "" then return "ERR" & my fieldSep & "near_equation" & my fieldSep & mSide
+				-- kIns visible characters come before the insertion point
+				set kIns to k + (count of prefixText)
+				set tLen to count of t
+				set leadMark to ""
+				set trailMark to ""
+				if ownPara then
+					if kIns > 0 then
+						if (id of (character kIns of t)) is not 13 then set leadMark to (character id 13)
+					end if
+					if kIns < tLen then
+						if (id of (character (kIns + 1) of t)) is not 13 then set trailMark to (character id 13)
+					end if
+				end if
+				set nLead to count of leadMark
+				set nTrail to count of trailMark
+				set stage to "start"
+				set errText to ""
+				set eqA to p + nLead
+				tell application "Microsoft Word"
+					set oldName to user name
+					set track revisions of d to true
+					set nMath0 to count of math objects of d
+					set e0 to end of content of text object of d
+					try
+						if authorName is not "" then set user name to authorName
+						set content of (create range d start p end p) to (leadMark & eqText & trailMark)
+						set e1 to end of content of text object of d
+						set eqB to p + (e1 - e0) - nTrail
+						set stage to "text"
+						create new equation from range (create range d start eqA end eqB) in document d
+						set stage to "equation"
+						set e2 to end of content of text object of d
+						build up (math object 1 of (create range d start eqA end (eqB + (e2 - e1))))
+						set stage to "built"
+					on error errMsg
+						set errText to errMsg
+					end try
+					set user name to oldName
+					set e3 to end of content of text object of d
+				end tell
+				-- Everything written now spans [p, p + grown); the equation itself is [eqA, zB)
+				set grown to e3 - e0
+				set zB to p + grown - nTrail
+				set eqRead to ""
+				if stage is not "start" then set eqRead to my readRange(d, eqA, zB)
+				set unbuilt to false
+				if stage is "built" then set unbuilt to my hasAnyOf(eqRead, unbuiltChars)
+				if unbuilt or stage is not "built" then
+					-- Take the insertion out again: deleting one's own pending insertion removes it without a trace
+					set cleaned to "1"
+					if grown > 0 then
+						tell application "Microsoft Word"
+							try
+								if authorName is not "" then set user name to authorName
+								set content of (create range d start p end (p + grown)) to ""
+							end try
+							set user name to oldName
+							set t3 to content of text object of d
+						end tell
+						if not (my textsEqual(t3, t)) then set cleaned to "0"
+					end if
+					if unbuilt then return "ERR" & my fieldSep & "equation_unbuilt" & my fieldSep & cleaned & my fieldSep & eqRead
+					return "ERR" & my fieldSep & "equation_failed" & my fieldSep & stage & my fieldSep & cleaned & my fieldSep & errText
+				end if
+				tell application "Microsoft Word"
+					set nMath1 to count of math objects of d
+					set nRev to count of revisions of d
+					set t2 to content of text object of d
+				end tell
+				-- Read the document back: its visible text must now differ only by the equation and the paragraph marks added for it
+				set headText to ""
+				if kIns > 0 then set headText to text 1 thru kIns of t
+				set tailText to ""
+				if kIns < tLen then set tailText to text (kIns + 1) thru -1 of t
+				set postStatus to "ok"
+				if eqRead is "" or not (my textsEqual(t2, headText & leadMark & eqRead & trailMark & tailText)) then set postStatus to "mismatch"
+				if postStatus is "ok" and nMath1 is not (nMath0 + 1) then set postStatus to "merged"
+				set ctxA to ""
+				if kIns > 0 then
+					set ctxFrom to kIns - 59
+					if ctxFrom < 1 then set ctxFrom to 1
+					set ctxA to text ctxFrom thru kIns of t
+				end if
+				set ctxB to tailText
+				if (count of tailText) > 60 then set ctxB to text 1 thru 60 of tailText
+				return "OK" & my fieldSep & nMath1 & my fieldSep & nRev & my fieldSep & postStatus & my fieldSep & nLead & my fieldSep & nTrail & my fieldSep & eqRead & my fieldSep & ctxA & my fieldSep & ctxB
+
+			else if op is "deleteequation" then
+				-- argv: deleteequation doc anchorText occurrence where(before|after) author
+				-- Delete, as a tracked change, the equation that directly follows (after) or precedes (before) the anchor text.
+				-- Paragraph marks and spaces between the two are skipped. An equation that fills a paragraph goes together with its paragraph mark.
+				set findText to item 3 of argv
+				set occ to (item 4 of argv) as integer
+				set placeWhere to item 5 of argv
+				set authorName to item 6 of argv
+				set {locStatus, n, k, t, docEnd, excess} to my locateVisible(d, findText, occ)
+				if locStatus is not "ok" then return "ERR" & my fieldSep & locStatus & my fieldSep & n
+				set findLen to count of findText
+				set pS to my posForVisible(d, k, docEnd, excess)
+				set pE to my endForVisible(d, pS, findLen, docEnd)
+				set got to my readRange(d, pS, pE)
+				if not (my textsEqual(got, findText)) then return my anchorMismatch(d, pS, pE, got)
+				set tLen to count of t
+				-- kx: index (from 0) of the visible character next to the anchor on that side
+				if placeWhere is "after" then
+					set kx to k + findLen
+					set stepBy to 1
+				else
+					set kx to k - 1
+					set stepBy to -1
+				end if
+				set hitPos to -1
+				repeat 4 times
+					if kx < 0 or kx ≥ tLen then exit repeat
+					set x to my posForVisible(d, kx, docEnd, excess)
+					if (my countMath(d, x, x + 1)) > 0 then
+						set hitPos to x
+						exit repeat
+					end if
+					set chId to id of (character (kx + 1) of t)
+					if not (chId is 13 or chId is 32 or chId is 160) then exit repeat
+					set kx to kx + stepBy
+				end repeat
+				if hitPos < 0 then return "ERR" & my fieldSep & "no_equation"
+				set {zA, zB} to my equationAt(d, hitPos)
+				if zA < 0 then return "ERR" & my fieldSep & "no_equation"
+				set eqRead to my readRange(d, zA, zB)
+				if eqRead is "" then return "ERR" & my fieldSep & "no_equation"
+				-- The equation's text must sit at that place in the document's text
+				set kA to my vis(d, 0, zA)
+				set eqLen to count of eqRead
+				if (kA + eqLen) > tLen then return "ERR" & my fieldSep & "verify_failed" & my fieldSep & eqRead
+				if not (my textsEqual(text (kA + 1) thru (kA + eqLen) of t, eqRead)) then return "ERR" & my fieldSep & "verify_failed" & my fieldSep & eqRead
+				-- Alone in its paragraph: take the paragraph mark behind it along, so that no empty paragraph is left.
+				-- (The mark in front stays: removing that one would give the paragraph above the formatting of the equation's paragraph.)
+				set dropMark to 0
+				set aloneBefore to (kA is 0)
+				if kA > 0 then set aloneBefore to ((id of (character kA of t)) is 13)
+				if aloneBefore and (kA + eqLen) < tLen and (zB + 1) < docEnd then
+					if (id of (character (kA + eqLen + 1) of t)) is 13 then
+						if (my readRange(d, zB, zB + 1)) is (character id 13) then set dropMark to 1
+					end if
+				end if
+				set errText to ""
+				tell application "Microsoft Word"
+					set oldName to user name
+					set track revisions of d to true
+					set nMath0 to count of math objects of d
+					try
+						if authorName is not "" then set user name to authorName
+						set content of (create range d start zA end (zB + dropMark)) to ""
+					on error errMsg
+						set errText to errMsg
+					end try
+					set user name to oldName
+					set nMath1 to count of math objects of d
+					set nRev to count of revisions of d
+					set t2 to content of text object of d
+				end tell
+				if errText is not "" then return "ERR" & my fieldSep & "write_failed" & my fieldSep & "0" & my fieldSep & errText
+				set headText to ""
+				if kA > 0 then set headText to text 1 thru kA of t
+				set tailText to ""
+				if (kA + eqLen + dropMark) < tLen then set tailText to text (kA + eqLen + dropMark + 1) thru -1 of t
+				set postStatus to "ok"
+				if not (my textsEqual(t2, headText & tailText)) then set postStatus to "mismatch"
+				set ctxA to headText
+				if (count of headText) > 60 then set ctxA to text -60 thru -1 of headText
+				set ctxB to tailText
+				if (count of tailText) > 60 then set ctxB to text 1 thru 60 of tailText
+				return "OK" & my fieldSep & nMath0 & my fieldSep & nMath1 & my fieldSep & nRev & my fieldSep & postStatus & my fieldSep & dropMark & my fieldSep & eqRead & my fieldSep & ctxA & my fieldSep & ctxB
 
 			else if op is "replaceimage" then
 				-- argv: replaceimage doc index expectedStart imagePath author

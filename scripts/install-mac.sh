@@ -9,7 +9,7 @@ DEST="${WORD_BRIDGE_HOME:-$HOME/.word-bridge}"
 umask 077
 mkdir -p "$DEST"
 chmod 700 "$DEST"
-for f in server.py client.py word_ops.applescript; do
+for f in server.py equation.py client.py word_ops.applescript; do
 	cp "$SRC/$f" "$DEST/$f"
 	chmod 600 "$DEST/$f"
 done

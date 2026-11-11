@@ -53,6 +53,8 @@ Only instructions, document text and replacement images travel over the tunnel. 
 | `word_list_images` | Lists the inline pictures with their size and the text above and below each |
 | `word_insert_image` | Inserts a new picture next to an anchor text, as a tracked change |
 | `word_replace_image` | Replaces one picture with a new image, as a tracked change |
+| `word_insert_equation` | Inserts a real Word equation, written in LaTeX, next to an anchor text |
+| `word_delete_equation` | Deletes the equation next to an anchor text, as a tracked change |
 | `word_list_changes` | Lists pending revisions and comments |
 
 Every write is a tracked change or a comment, authored as the name set in `config.json` (default `Claude`). The bridge never saves, closes, opens, accepts or rejects anything.
@@ -118,6 +120,19 @@ The first time the server talks to Word, macOS may ask whether to allow it to co
 
 **Word may shrink the picture when it saves.** Unless picture compression is turned off for the document, Word downsamples pictures to about 220 ppi on save; in our test a 6375-pixel-wide figure was stored at 440 pixels. To keep the full resolution, tick "Do not compress images in file" under Word > Preferences > Edit > Image Size and Quality for that document. The bridge cannot read or change this setting.
 
+## Equations
+
+`word_insert_equation` writes a real Word equation, the kind Insert > Equation makes, as a tracked change. The agent passes LaTeX. The bridge translates it into the linear format that Word's own equation engine reads, has Word build the equation, and reads the result back.
+
+- **Inline or display.** By default the equation sits in the sentence. With `own_paragraph` it gets a paragraph to itself, and Word shows it as a centred display equation.
+- **Which LaTeX is understood.** Fractions, roots, sub- and superscripts, sums, products and integrals with limits, Greek letters and the common symbols, accents, `\text`, `\mathrm`, `\mathbf`, `\mathbb`, `\mathcal`, functions such as `\log` and `\operatorname`, `\left` and `\right`, matrices, `cases` and `aligned`. A command outside this set is refused with a message that names it; nothing is guessed. `format: "unicodemath"` takes Word's linear format directly, for anything the LaTeX mode does not cover.
+- **A formula Word cannot build is taken out again.** If part of a formula is still raw text after Word has built it, the bridge removes what it wrote and reports an error, so no half-built equation stays in the document.
+- **Existing equations are protected.** Nothing is written into an equation: an edit whose text lies inside one or spans one is refused, and so is a new equation placed directly against another, which Word would merge into one. Text inserted right behind an equation would normally become part of it; the bridge writes it so that it stays normal text, at the price of one re-typed character in the tracked changes.
+- **Reading.** Word reports an equation as its characters with a paragraph mark at every structure boundary, so a simple fraction reads as three short lines. In a document with up to 40 equations the bridge finds each one and shows it on one line as `⟦…⟧`. In a document with more, the text is left as Word reports it, because Word needs about 50 ms per equation to say where it is.
+- **Correcting.** `word_delete_equation` removes the equation next to an anchor text. When that equation is the agent's own insertion and you have not accepted it yet, it disappears without leaving a revision.
+
+Not supported: equation numbers, editing an equation in place, and upright bold (`\mathbf` and `\boldsymbol` both come out bold italic). The read-back confirms where the equation is and that Word built all of it. It cannot confirm that the formula looks right, so check new formulas in Word.
+
 ## Citations and other fields
 
 A manuscript managed with a reference manager is full of fields: every citation carries a few thousand characters of hidden code, and the bibliography is one large field. The bridge treats them as follows.
@@ -152,11 +167,12 @@ Host myserver
 ## Limitations
 
 - **No table structure or layout changes.** Tables are read as flattened text. Pictures can be inserted or replaced whole, not cropped or moved, and only inline pictures are handled (not floating ones).
+- **Equations are inserted and deleted whole.** They cannot be edited in place or numbered, and in a document with more than 40 equations they are not grouped in the text the agent reads.
 - **Matching is exact.** The anchor text must match character for character and be unique, or the call is refused. Anchors with a footnote mark or an existing revision at their edge may fail the verification step; the bridge then makes no change.
 - **One open document per file name.** Word's scripting interface cannot address two open documents with the same file name separately: it resolves both to the same one. The bridge therefore refuses that name until one copy is closed. Word may then need the remaining document closed and reopened before scripts can find it again; the bridge says so when that happens.
 - **Authorship is set by briefly switching Word's user name** during each write and restoring it afterwards. If you type in that instant, your keystrokes may be attributed to the agent.
 - **Reading excludes tracked deletions.** The text is what you would get after accepting all changes.
-- **Tested on one setup:** Word for Mac 16.114, macOS client with OpenSSH 10, a Linux remote host, Claude Code 2.1. Word for Windows is not supported (the bridge uses AppleScript).
+- **Tested on one setup:** Word for Mac 16.114 and 16.115, macOS client with OpenSSH 10, a Linux remote host, Claude Code 2.1. Word for Windows is not supported (the bridge uses AppleScript).
 
 ## Troubleshooting
 
