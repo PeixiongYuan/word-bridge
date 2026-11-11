@@ -28,6 +28,7 @@ DEFAULT_DPI = 900
 MAX_IMAGE_BYTES = 120 * 1024 * 1024
 MAX_PIXELS = 250 * 1000 * 1000
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+IMAGE_TOOLS = ("word_replace_image", "word_insert_image")  # calls that carry an image read on this machine
 
 DOWN_MESSAGE = (
     "The Word bridge cannot reach the user's Mac right now. Possible causes: the Mac is asleep or offline, the SSH connection from the Mac to this host has dropped, "
@@ -266,7 +267,7 @@ def main():
             continue
         expect_reply = "id" in msg and "method" in msg
         params = msg.get("params") if isinstance(msg.get("params"), dict) else {}
-        if msg.get("method") == "tools/call" and params.get("name") == "word_replace_image":
+        if msg.get("method") == "tools/call" and params.get("name") in IMAGE_TOOLS:
             # The image is on this machine: read it and turn it into a PNG here, then send it to the Mac with the call
             try:
                 prepare_image(params.setdefault("arguments", {}))

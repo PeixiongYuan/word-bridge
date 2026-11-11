@@ -176,6 +176,54 @@ on fieldDetails(d, pS, a, b)
 	return my joinList(outRows, my recSep)
 end fieldDetails
 
+-- Where to insert between two visible characters of the located text [pS,pE): prefixText is the part of findText in front of the point.
+-- Checks the text on both sides, then picks a position outside every field.
+-- Returns {status, position, detail}; status is "ok", "verify_failed" or "in_field".
+on insertionPoint(d, pS, pE, findText, prefixText, docEnd, nFields, allowFields)
+	set segOff to count of prefixText
+	if segOff > 0 then
+		set pA to my endForVisible(d, pS, segOff, docEnd)
+	else
+		set pA to pS
+	end if
+	set pB to my startForVisible(d, pS, segOff, docEnd)
+	set restText to ""
+	if segOff < (count of findText) then set restText to text (segOff + 1) thru -1 of findText
+	set gotA to my readRange(d, pS, pA)
+	if not (my textsEqual(gotA, prefixText)) then return {"verify_failed", -1, gotA}
+	set gotB to my readRange(d, pB, pE)
+	if not (my textsEqual(gotB, restText)) then return {"verify_failed", -1, gotB}
+	set p to -1
+	if nFields is 0 then
+		set p to pA
+	else if segOff > 0 then
+		-- After the preceding text: right behind it, else just past a field's end mark, else in front of the next visible character
+		set cands to {pA}
+		if pA < pB then set cands to {pA, pA + 1, pB}
+		repeat with cand in cands
+			if (my fieldDepth(d, (contents of cand), docEnd, nFields)) is 0 then
+				set p to (contents of cand)
+				exit repeat
+			end if
+		end repeat
+	else
+		-- In front of the anchor: at its first character, or in front of the field when the anchor starts with a field's result
+		if (my fieldDepth(d, pS, docEnd, nFields)) is 0 then
+			set p to pS
+		else
+			set markPos to my fieldMarkBefore(d, pS)
+			if markPos ≥ 0 then
+				if (my fieldDepth(d, markPos, docEnd, nFields)) is 0 then set p to markPos
+			end if
+		end if
+	end if
+	if p < 0 then
+		if not allowFields then return {"in_field", -1, ""}
+		set p to pA
+	end if
+	return {"ok", p, ""}
+end insertionPoint
+
 -- Locate the occ-th occurrence of findText in the document (occ=0 means it must be unique).
 -- Returns {status, number of occurrences, visible offset k, full text t, docEnd, excess}
 on locateVisible(d, findText, occ)
@@ -353,45 +401,9 @@ on run argv
 							end if
 						end if
 					else
-						-- Pure insertion between two visible characters: check the text on both sides, then pick a position outside every field
-						if segOff > 0 then
-							set pA to my endForVisible(d, pS, segOff, docEnd)
-						else
-							set pA to pS
-						end if
-						set pB to my startForVisible(d, pS, segOff, docEnd)
-						set restText to ""
-						if segOff < findLen then set restText to text (segOff + 1) thru -1 of findText
-						if not (my textsEqual(my readRange(d, pS, pA), prefixText)) then return "ERR" & my fieldSep & "verify_failed" & my fieldSep & (my readRange(d, pS, pA))
-						if not (my textsEqual(my readRange(d, pB, pE), restText)) then return "ERR" & my fieldSep & "verify_failed" & my fieldSep & (my readRange(d, pB, pE))
-						set p to -1
-						if nFields is 0 then
-							set p to pA
-						else if segOff > 0 then
-							-- After the preceding text: right behind it, else just past a field's end mark, else in front of the next visible character
-							set cands to {pA}
-							if pA < pB then set cands to {pA, pA + 1, pB}
-							repeat with cand in cands
-								if (my fieldDepth(d, (contents of cand), docEnd, nFields)) is 0 then
-									set p to (contents of cand)
-									exit repeat
-								end if
-							end repeat
-						else
-							-- In front of the anchor: at its first character, or in front of the field when the anchor starts with a field's result
-							if (my fieldDepth(d, pS, docEnd, nFields)) is 0 then
-								set p to pS
-							else
-								set markPos to my fieldMarkBefore(d, pS)
-								if markPos ≥ 0 then
-									if (my fieldDepth(d, markPos, docEnd, nFields)) is 0 then set p to markPos
-								end if
-							end if
-						end if
-						if p < 0 then
-							if not allowFields then return "ERR" & my fieldSep & "in_field" & my fieldSep & ""
-							set p to pA
-						end if
+						-- Pure insertion between two visible characters
+						set {insStatus, p, insDetail} to my insertionPoint(d, pS, pE, findText, prefixText, docEnd, nFields, allowFields)
+						if insStatus is not "ok" then return "ERR" & my fieldSep & insStatus & my fieldSep & insDetail
 						set q to p
 					end if
 					if p < lastQ then return "ERR" & my fieldSep & "bad_segments" & my fieldSep & i
@@ -512,13 +524,15 @@ on run argv
 				return "OK" & my fieldSep & n & my fieldSep & p & my fieldSep & q
 
 			else if op is "images" then
-				-- List the inline pictures: index, type, width and height (points), position, whether tracked-deleted, text around
+				-- List the inline pictures: index, type, width and height (points), position, whether tracked-deleted, text around.
+				-- The text around is cut from the document's visible text: a range that starts just before a picture may start inside a field code.
 				set imgRows to {}
 				tell application "Microsoft Word"
 					set nShapes to count of inline shapes of d
 					set nFloating to count of shapes of d
-					set docEnd to end of content of text object of d
+					set t to content of text object of d
 				end tell
+				set tLen to count of t
 				repeat with i from 1 to nShapes
 					tell application "Microsoft Word"
 						set shp to inline shape i of d
@@ -526,23 +540,146 @@ on run argv
 						set shpW to width of shp
 						set shpH to height of shp
 						set shpStart to start of content of text object of shp
-						set shpEnd to end of content of text object of shp
 						set selfText to content of text object of shp
-						set ctxA to shpStart - 150
-						if ctxA < 0 then set ctxA to 0
-						set ctxB to shpEnd + 260
-						if ctxB > docEnd then set ctxB to docEnd
-						set textAbove to ""
-						if shpStart > ctxA then set textAbove to content of (create range d start ctxA end shpStart)
-						set textBelow to ""
-						if ctxB > shpEnd then set textBelow to content of (create range d start shpEnd end ctxB)
 					end tell
 					if selfText is missing value then set selfText to ""
-					if textAbove is missing value then set textAbove to ""
-					if textBelow is missing value then set textBelow to ""
-					set end of imgRows to (i as text) & my fieldSep & shpKind & my fieldSep & (shpW as text) & my fieldSep & (shpH as text) & my fieldSep & (shpStart as text) & my fieldSep & ((count of selfText) as text) & my fieldSep & textAbove & my fieldSep & textBelow
+					set selfLen to count of selfText
+					set nBefore to my vis(d, 0, shpStart)
+					set textAbove to ""
+					if nBefore > 0 then
+						set fromChar to nBefore - 149
+						if fromChar < 1 then set fromChar to 1
+						set textAbove to text fromChar thru nBefore of t
+					end if
+					set textBelow to ""
+					set belowFrom to nBefore + selfLen + 1
+					if belowFrom ≤ tLen then
+						set belowTo to belowFrom + 259
+						if belowTo > tLen then set belowTo to tLen
+						set textBelow to text belowFrom thru belowTo of t
+					end if
+					set end of imgRows to (i as text) & my fieldSep & shpKind & my fieldSep & (shpW as text) & my fieldSep & (shpH as text) & my fieldSep & (shpStart as text) & my fieldSep & (selfLen as text) & my fieldSep & textAbove & my fieldSep & textBelow
 				end repeat
 				return "OK" & my fieldSep & nShapes & my fieldSep & nFloating & my recSep & my joinList(imgRows, my recSep)
+
+			else if op is "insertimage" then
+				-- argv: insertimage doc anchorText occurrence where(before|after) imagePath author widthPoints ownParagraph(1|0)
+				-- Insert a new inline picture before or after the anchor text, as a tracked change.
+				-- With ownParagraph the picture gets a paragraph to itself: paragraph marks are added only where none is there already.
+				set findText to item 3 of argv
+				set occ to (item 4 of argv) as integer
+				set placeWhere to item 5 of argv
+				set imgPath to item 6 of argv
+				set authorName to item 7 of argv
+				set wantWidth to (item 8 of argv) as real
+				set ownPara to ((item 9 of argv) is "1")
+				set {locStatus, n, k, t, docEnd, excess} to my locateVisible(d, findText, occ)
+				if locStatus is not "ok" then return "ERR" & my fieldSep & locStatus & my fieldSep & n
+				set findLen to count of findText
+				set pS to my posForVisible(d, k, docEnd, excess)
+				set pE to my endForVisible(d, pS, findLen, docEnd)
+				set got to my readRange(d, pS, pE)
+				if not (my textsEqual(got, findText)) then return "ERR" & my fieldSep & "verify_failed" & my fieldSep & got
+				set nFields to my countFields(d, 0, docEnd)
+				set prefixText to ""
+				if placeWhere is "after" then set prefixText to findText
+				set {insStatus, p, insDetail} to my insertionPoint(d, pS, pE, findText, prefixText, docEnd, nFields, false)
+				if insStatus is not "ok" then return "ERR" & my fieldSep & insStatus & my fieldSep & insDetail
+				-- kIns visible characters come before the insertion point
+				set kIns to k + (count of prefixText)
+				set tLen to count of t
+				set leadMark to ""
+				set trailMark to ""
+				if ownPara then
+					if kIns > 0 then
+						if (id of (character kIns of t)) is not 13 then set leadMark to (character id 13)
+					end if
+					if kIns < tLen then
+						if (id of (character (kIns + 1) of t)) is not 13 then set trailMark to (character id 13)
+					end if
+				end if
+				set picPos to p + (count of leadMark)
+				tell application "Microsoft Word"
+					set textWidth to 0
+					try
+						set ps to page setup of d
+						set textWidth to (page width of ps) - (left margin of ps) - (right margin of ps)
+					end try
+				end tell
+				set stage to "start"
+				tell application "Microsoft Word"
+					set oldName to user name
+					set track revisions of d to true
+					try
+						if authorName is not "" then set user name to authorName
+						if (leadMark & trailMark) is not "" then
+							set content of (create range d start p end p) to (leadMark & trailMark)
+							set stage to "marks"
+						end if
+						make new inline picture at (create range d start picPos end picPos) with properties {file name:imgPath, link to file:false, save with document:true}
+						set stage to "inserted"
+						-- Find the new picture by its position
+						set shpIndex to 0
+						set nShapes to count of inline shapes of d
+						repeat with i from 1 to nShapes
+							if (start of content of text object of inline shape i of d) is picPos then
+								set shpIndex to i
+								exit repeat
+							end if
+						end repeat
+						if shpIndex is 0 then error "the new picture was not found at the expected position after inserting it"
+						set newShp to inline shape shpIndex of d
+						set natW to width of newShp
+						set natH to height of newShp
+						set finalW to natW
+						if wantWidth > 0 then
+							set finalW to wantWidth
+						else if textWidth > 0 and natW > textWidth then
+							set finalW to textWidth
+						end if
+						if finalW is not natW then
+							try
+								set lock aspect ratio of newShp to true
+							end try
+							set width of newShp to finalW
+							set height of newShp to (finalW * natH / natW)
+						end if
+						set stage to "sized"
+						if ownPara then
+							-- A paragraph with exact line spacing would crop the picture to one line
+							try
+								set pf to paragraph format of (create range d start picPos end (picPos + 1))
+								if (line spacing rule of pf) is line space exactly then set line spacing rule of pf to line space single
+							end try
+						end if
+						set user name to oldName
+					on error errMsg
+						set user name to oldName
+						return "ERR" & my fieldSep & "insert_image_failed" & my fieldSep & stage & my fieldSep & errMsg
+					end try
+					set finalShp to inline shape shpIndex of d
+					set newW to width of finalShp
+					set newH to height of finalShp
+					set nRev to count of revisions of d
+					set t2 to content of text object of d
+				end tell
+				-- Read the document back: its visible text must now differ only by the picture and the paragraph marks added for it
+				set picText to my readRange(d, picPos, picPos + 1)
+				set headText to ""
+				if kIns > 0 then set headText to text 1 thru kIns of t
+				set tailText to ""
+				if kIns < tLen then set tailText to text (kIns + 1) thru -1 of t
+				set postStatus to "ok"
+				if picText is "" or not (my textsEqual(t2, headText & leadMark & picText & trailMark & tailText)) then set postStatus to "mismatch"
+				set ctxA to ""
+				if kIns > 0 then
+					set ctxFrom to kIns - 59
+					if ctxFrom < 1 then set ctxFrom to 1
+					set ctxA to text ctxFrom thru kIns of t
+				end if
+				set ctxB to tailText
+				if (count of tailText) > 60 then set ctxB to text 1 thru 60 of tailText
+				return "OK" & my fieldSep & shpIndex & my fieldSep & (natW as text) & my fieldSep & (natH as text) & my fieldSep & (newW as text) & my fieldSep & (newH as text) & my fieldSep & nRev & my fieldSep & postStatus & my fieldSep & (count of leadMark) & my fieldSep & (count of trailMark) & my fieldSep & ctxA & my fieldSep & ctxB
 
 			else if op is "replaceimage" then
 				-- argv: replaceimage doc index expectedStart imagePath author

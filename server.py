@@ -37,7 +37,7 @@ AUDIT_PATH = os.path.join(BASE, "audit.log")
 SCRIPT_PATH = os.path.join(BASE, "word_ops.applescript")
 
 US, RS, GS = "\x1f", "\x1e", "\x1d"
-SERVER_INFO = {"name": "word-bridge", "version": "1.3.0"}
+SERVER_INFO = {"name": "word-bridge", "version": "1.4.0"}
 MAX_IMAGE_BYTES = 120 * 1024 * 1024
 KNOWN_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 
@@ -50,8 +50,10 @@ INSTRUCTIONS = (
     "3. find/anchor text must match the document character for character and occur exactly once. If it occurs more than once, add context to make it unique, "
     "or pick one with occurrence. Prefer snippets that stay within one paragraph.\n"
     "4. Change only the small piece that needs changing instead of rewriting whole paragraphs, so the tracked changes stay readable.\n"
-    "5. Pictures can only be replaced whole (word_list_images to look, word_replace_image to replace), by default with a 900 dpi PNG; "
-    "table structure and layout are beyond these tools, so tell the user when those are needed.\n"
+    "5. Pictures: word_list_images shows the inline pictures, word_replace_image replaces one whole, and word_insert_image adds a new one "
+    "next to an anchor text (for a figure, in front of the start of its caption). The default is a 900 dpi PNG. "
+    "In text you read, a picture shows up as a single / character. "
+    "Table structure and layout are beyond these tools, so tell the user when those are needed.\n"
     "6. Text you read does not include tracked deletions: it is the document as it would be after accepting all changes.\n"
     "7. Fields (citations such as Zotero's, the bibliography, cross-references, a table of contents, hyperlinks) are protected. Text around a citation can be edited "
     "and the citation stays intact; an edit that would rewrite or delete a field is refused unless you pass allow_field_changes. "
@@ -159,6 +161,13 @@ def explain_error(code, detail):
         hint = {"start": "Nothing was changed.", "inserted": "The new picture was inserted, but it was not resized and the old one was not deleted; ask the user to check that spot.",
                 "resized": "The new picture was inserted and resized, but the old one was not deleted; ask the user to check that spot."}.get(stage, "")
         return f"Word reported an error while replacing the picture (stage {stage}): {msg[:300]} {hint}"
+    if code == "insert_image_failed":
+        stage, _, msg = detail.partition(US)
+        hint = {"start": "Nothing was changed.",
+                "marks": "The paragraph mark for the picture was inserted, but the picture itself was not; ask the user to check that spot.",
+                "inserted": "The picture was inserted, but it could not be found again to set its size; ask the user to check that spot.",
+                "sized": "The picture was inserted and sized."}.get(stage, "")
+        return f"Word reported an error while inserting the picture (stage {stage}): {msg[:300]} {hint}"
     if code == "write_failed":
         done, _, msg = detail.partition(US)
         partial = "" if done in ("", "0") else f" {done} part(s) of this edit had already been written; ask the user to check that passage."
@@ -670,9 +679,13 @@ def tool_list_images(args):
     return "\n".join(lines)
 
 
-def tool_replace_image(args):
-    name = args["document"]
-    cfg, spec = check_doc(name)
+COMPRESSION_NOTE = (
+    "Tell the user: unless picture compression is turned off for this document, Word downsamples pictures to about 220 ppi when it saves. "
+    "To keep the full resolution, tick “Do not compress images in file” under Word > Preferences > Edit > Image Size and Quality.")
+
+
+def image_from_call(args):
+    """The PNG that client.py attached to the call: (bytes, width in pixels, height in pixels, dpi or None)."""
     data_b64 = args.get("image_data")
     if not data_b64:
         raise ToolError("This call carried no image data. The image is read by client.py on the remote side and sent with the call; make sure client.py on the remote host is up to date.")
@@ -685,7 +698,55 @@ def tool_replace_image(args):
     info = png_info(data)
     if info is None:
         raise ToolError("The data received is not a PNG. Provide a PNG, or a PDF for the remote side to render to PNG.")
-    px_w, px_h, dpi = info
+    return (data,) + info
+
+
+def tool_insert_image(args):
+    name = args["document"]
+    cfg, spec = check_doc(name)
+    anchor = to_word(args.get("anchor") or "")
+    where = args.get("position", "before")
+    occurrence = max(0, int(args.get("occurrence", 0)))
+    own_paragraph = bool(args.get("own_paragraph", True))
+    if not anchor:
+        raise ToolError("anchor must not be empty: give a piece of existing text next to where the picture should go, for example the start of its caption.")
+    if where not in ("after", "before"):
+        raise ToolError("position must be before or after.")
+    try:
+        width_cm = float(args.get("width_cm") or 0)
+    except (TypeError, ValueError):
+        raise ToolError("width_cm must be a number.")
+    if width_cm and not 0.5 <= width_cm <= 55:
+        raise ToolError("width_cm must be between 0.5 and 55.")
+    data, px_w, px_h, dpi = image_from_call(args)
+    with serve_image(data) as url:
+        rest = run_word("insertimage", spec, anchor, occurrence, where, url, cfg.get("author", "Claude"),
+                        f"{width_cm * 72 / 2.54:.2f}", "1" if own_paragraph else "0", timeout=240)
+    index, nat_w, _, new_w, new_h, n_rev, post, n_lead, n_trail, ctx_a, ctx_b = rest.split(US, 10)
+    verified = post == "ok"
+    audit({"tool": "insert_image", "document": name, "location": spec.partition(GS)[2], "anchor": anchor, "where": where,
+           "index": int(index), "image": args.get("image_name"), "source": args.get("image_path"), "bytes": len(data),
+           "pixels": [px_w, px_h], "dpi": dpi, "verified": verified})
+    note = args.get("image_note") or ""
+    fitted = "" if width_cm or pt_to_cm(new_w) >= pt_to_cm(nat_w) - 0.02 else " It was scaled down to fit the width of the text area."
+    placing = "in a paragraph of its own" if own_paragraph else "inline with the text"
+    if verified:
+        check = (f"Verified by reading the document back. Around the picture (shown as «/») the text now reads: "
+                 f"…{visible(ctx_a)}{'⏎' * int(n_lead)}«/»{'⏎' * int(n_trail)}{visible(ctx_b)}…")
+    else:
+        check = ("WARNING: the picture was inserted, but when the document was read back its text did not match what this insertion should have produced. "
+                 "It may have landed in the wrong place, or the user may have been typing at the same moment. "
+                 "Stop editing this document, check with word_list_images, and tell the user.")
+    return (f"Inserted a new picture (now #{index}) as a tracked change {where} the anchor text, {placing}.\n"
+            f"New image: {px_w} × {px_h} pixels, {str(dpi) + ' dpi' if dpi else 'no dpi recorded'}. {note}\n"
+            f"Displayed size: {pt_to_cm(new_w):.2f} × {pt_to_cm(new_h):.2f} cm.{fitted} The document now has {n_rev} pending revisions.\n"
+            f"{check}\n{COMPRESSION_NOTE}")
+
+
+def tool_replace_image(args):
+    name = args["document"]
+    cfg, spec = check_doc(name)
+    data, px_w, px_h, dpi = image_from_call(args)
 
     n_inline, _, images = list_images(spec)
     live = [img for img in images if not img["deleted"]]
@@ -727,8 +788,7 @@ def tool_replace_image(args):
             f"New image: {px_w} × {px_h} pixels, {str(dpi) + ' dpi' if dpi else 'no dpi recorded'}. {note}\n"
             f"Displayed size: {pt_to_cm(old_w):.2f} × {pt_to_cm(old_h):.2f} cm → {pt_to_cm(new_w):.2f} × {pt_to_cm(new_h):.2f} cm (width kept from the old picture, height from the new image's proportions).\n"
             f"The old picture stays as a tracked deletion until the user accepts it. The document now has {n_rev} pending revisions.\n"
-            "Tell the user: unless picture compression is turned off for this document, Word downsamples pictures to about 220 ppi when it saves. "
-            "To keep the full resolution, tick “Do not compress images in file” under Word > Preferences > Edit > Image Size and Quality.")
+            + COMPRESSION_NOTE)
 
 
 DOC_PROP = {"type": "string", "description": "Document file name, for example report.docx. Use word_list_documents to see which documents are available."}
@@ -793,6 +853,24 @@ TOOLS = [
      "description": "List the inline pictures in the document: index, displayed size, and the text above and below each (the text below is usually the caption). Use it before replacing a picture to confirm which one.",
      "inputSchema": {"type": "object", "properties": {"document": DOC_PROP}, "required": ["document"]},
      "handler": tool_list_images},
+    {"name": "word_insert_image",
+     "description": ("Insert a NEW picture next to an anchor text, as a tracked change. For a figure, use the start of its caption as the anchor with position before: "
+                     "the picture then gets a paragraph of its own above the caption. "
+                     "image_path is a file path ON THE MACHINE YOU ARE RUNNING ON; the local client reads the file and sends it. "
+                     "The default is a 900 dpi PNG: a PDF is rendered to a 900 dpi PNG, and a PNG below that resolution is swapped for a PDF of the same name next to it, "
+                     "if there is one. Without width_cm the picture keeps its natural size, scaled down if needed to fit the width of the text area. "
+                     "To swap a picture that is already there, use word_replace_image instead."),
+     "inputSchema": {"type": "object", "properties": {
+         "document": DOC_PROP,
+         "image_path": {"type": "string", "description": "Path of the image on your machine, PNG or PDF."},
+         "anchor": {"type": "string", "description": "A piece of existing text next to where the picture should go (matching character for character, and unique), usually the start of the figure's caption."},
+         "position": {"type": "string", "enum": ["before", "after"], "description": "Put the picture before or after the anchor; default before (figure above its caption).", "default": "before"},
+         "occurrence": OCC_PROP,
+         "width_cm": {"type": "number", "description": "Displayed width in centimetres; the height follows the image's proportions. Omit to keep the natural size, limited to the width of the text area."},
+         "own_paragraph": {"type": "boolean", "description": "Give the picture a paragraph of its own (default true). Set false to place it inline within the text.", "default": True},
+         "dpi": {"type": "integer", "description": "Target resolution; default 900.", "default": 900}},
+         "required": ["document", "image_path", "anchor"]},
+     "handler": tool_insert_image},
     {"name": "word_replace_image",
      "description": ("Replace one picture in the document with a new image as a tracked change: the new picture keeps the old one's displayed width, and its height follows the new image's proportions. "
                      "image_path is a file path ON THE MACHINE YOU ARE RUNNING ON; the local client reads the file and sends it. "
