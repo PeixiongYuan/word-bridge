@@ -1,7 +1,7 @@
 {
   "allowed_documents": [
     "report.docx",
-    "response_letter.docx"
+    "~/Documents/paper/response_letter.docx"
   ],
   "author": "Claude",
   "ssh_host": "myserver",

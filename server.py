@@ -4,7 +4,8 @@
 Lets a remote Claude make tracked edits, through MCP tools, in documents that are open in Word on this Mac.
 
 - Listens on a Unix socket only this user can reach; a connection presents the token first, then speaks MCP (newline-delimited JSON-RPC).
-- Only documents listed in config.json can be touched, and only tracked edits and comments are made;
+- Only documents listed in config.json can be touched (by file name, or pinned to one file by full path or URL),
+  and only tracked edits and comments are made;
   it never saves or closes a document, and never accepts or rejects a revision.
 - Every write is recorded in audit.log.
 - A background thread keeps the SSH reverse tunnel to the remote host alive. It only reuses the master connection
@@ -14,6 +15,7 @@ Standard library only.
 """
 import base64
 import contextlib
+import difflib
 import hmac
 import http.server
 import json
@@ -25,6 +27,8 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
+import urllib.parse
 
 BASE = os.environ.get("WORD_BRIDGE_HOME") or os.path.expanduser("~/.word-bridge")
 CONFIG_PATH = os.path.join(BASE, "config.json")
@@ -33,7 +37,7 @@ AUDIT_PATH = os.path.join(BASE, "audit.log")
 SCRIPT_PATH = os.path.join(BASE, "word_ops.applescript")
 
 US, RS, GS = "\x1f", "\x1e", "\x1d"
-SERVER_INFO = {"name": "word-bridge", "version": "1.1.0"}
+SERVER_INFO = {"name": "word-bridge", "version": "1.3.0"}
 MAX_IMAGE_BYTES = 120 * 1024 * 1024
 KNOWN_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 
@@ -44,11 +48,16 @@ INSTRUCTIONS = (
     "2. Before editing, read the CURRENT content with word_read_document or word_find_text. The user may have just changed it, "
     "so do not rely on the .docx on disk or on text you remember.\n"
     "3. find/anchor text must match the document character for character and occur exactly once. If it occurs more than once, add context to make it unique, "
-    "or pick one with occurrence. Prefer snippets that stay within one paragraph and contain no citation fields (such as Zotero citations).\n"
+    "or pick one with occurrence. Prefer snippets that stay within one paragraph.\n"
     "4. Change only the small piece that needs changing instead of rewriting whole paragraphs, so the tracked changes stay readable.\n"
     "5. Pictures can only be replaced whole (word_list_images to look, word_replace_image to replace), by default with a 900 dpi PNG; "
     "table structure and layout are beyond these tools, so tell the user when those are needed.\n"
-    "6. Text you read does not include tracked deletions: it is the document as it would be after accepting all changes."
+    "6. Text you read does not include tracked deletions: it is the document as it would be after accepting all changes.\n"
+    "7. Fields (citations such as Zotero's, the bibliography, cross-references, a table of contents, hyperlinks) are protected. Text around a citation can be edited "
+    "and the citation stays intact; an edit that would rewrite or delete a field is refused unless you pass allow_field_changes. "
+    "A citation shows up in the text as its number or label, for example the 3,4 in 'levels3,4.'; keep it unchanged in replace.\n"
+    "8. Every write is checked by reading the document back, and the result shows the passage as it now reads. "
+    "If a result carries a WARNING, stop editing that document and tell the user."
 )
 
 word_lock = threading.Lock()
@@ -81,9 +90,10 @@ def load_token():
 class ToolError(Exception):
     """An error to report back to the model. code is the Word script's error code, when there is one."""
 
-    def __init__(self, message, code=None):
+    def __init__(self, message, code=None, detail=""):
         super().__init__(message)
         self.code = code
+        self.detail = detail
 
 
 # ---------------------------------------------------------------- Calling Word
@@ -108,12 +118,18 @@ def run_word(*args, timeout=150):
     if head == "OK":
         return rest
     code, _, detail = rest.partition(US)
-    raise ToolError(explain_error(code, detail), code)
+    raise ToolError(explain_error(code, detail), code, detail)
 
 
 def explain_error(code, detail):
     if code == "not_open":
         return "This document is not open in Word right now. Ask the user to open it first."
+    if code == "duplicate_name":
+        return DUPLICATE_REFUSAL
+    if code == "wrong_file":
+        return WRONG_FILE_REFUSAL
+    if code == "lost_document":
+        return LOST_REFUSAL
     if code == "notfound":
         return ("This text was not found in the document's current content (it must match character for character, including spaces and punctuation). "
                 "Check the current text with word_find_text or word_read_document first.")
@@ -124,8 +140,16 @@ def explain_error(code, detail):
         return f"occurrence is out of range: this text occurs only {detail} times."
     if code == "verify_failed":
         return ("The text read back at the located position did not match, so nothing was changed. "
-                "This usually means the snippet contains a citation field, a footnote mark or an existing revision. Use a nearby snippet without those as the anchor. "
+                "This can happen when the snippet has a footnote mark, a combining character or an existing revision at its edge. Use a nearby snippet as the anchor. "
                 f"(Read at that position: {detail[:80]!r})")
+    if code == "in_field":
+        return ("This spot is inside a field (a citation, the bibliography, a cross-reference, a table of contents or a hyperlink), so nothing was changed. "
+                "Word regenerates what a field shows, and an edit there would be lost or would break the field. Use text outside the field instead. "
+                "To change the field's own text on purpose, call word_replace_text with allow_field_changes=true.")
+    if code == "field_in_range":
+        return FIELD_REFUSAL
+    if code == "bad_segments":
+        return "Internal error: the parts of this edit overlap. Nothing was changed."
     if code == "badindex":
         return f"Picture index out of range: the document has only {detail} inline pictures. Check with word_list_images first."
     if code == "stale":
@@ -136,20 +160,132 @@ def explain_error(code, detail):
                 "resized": "The new picture was inserted and resized, but the old one was not deleted; ask the user to check that spot."}.get(stage, "")
         return f"Word reported an error while replacing the picture (stage {stage}): {msg[:300]} {hint}"
     if code == "write_failed":
-        return "Word refused this write: " + detail[:300]
+        done, _, msg = detail.partition(US)
+        partial = "" if done in ("", "0") else f" {done} part(s) of this edit had already been written; ask the user to check that passage."
+        return "Word refused this write: " + msg[:300] + partial
     if code == "exception":
         return "The Word script failed: " + detail[:300]
     return f"Unknown error {code}: {detail[:200]}"
 
 
-def check_doc(name):
+FIELD_REFUSAL = (
+    "This edit would rewrite or delete a field (a citation, a cross-reference or a hyperlink) that lies inside the text to replace, so nothing was changed. "
+    "Keep the field's visible text (for a citation, its number or label) unchanged and in the same order in replace, or edit the text before and after it in separate calls. "
+    "To delete or overwrite the field on purpose, repeat the call with allow_field_changes=true.")
+
+
+DUPLICATE_REFUSAL = (
+    "Two documents with this file name are open in Word at the same time. Word's scripting interface cannot tell them apart reliably, "
+    "so nothing was read or changed. Ask the user to close the copy that should not be edited, then retry.")
+WRONG_FILE_REFUSAL = (
+    "A document with this file name is open in Word, but it is not the file on the allow-list: same name, different location. "
+    "Nothing was read or changed. Ask the user to open the allowed file instead, or to update allowed_documents in ~/.word-bridge/config.json on the Mac.")
+
+
+LOST_REFUSAL = (
+    "This document is open, but Word's scripting interface has lost track of it, which happens after two documents with the same file name "
+    "were open and one of them was closed. Nothing was read or changed. Ask the user to close this document and open it again.")
+
+
+def is_location(entry):
+    """An allow-list entry that pins one file: a path or a URL. Anything else is a bare file name."""
+    return "/" in entry or entry.startswith("~")
+
+
+def entry_name(entry):
+    """The file name an allow-list entry stands for."""
+    if "://" in entry:
+        return urllib.parse.unquote(entry.rstrip("/").rsplit("/", 1)[-1])
+    if is_location(entry):
+        return os.path.basename(os.path.expanduser(entry))
+    return entry
+
+
+def same_location(entry, place):
+    """Whether an allow-list path or URL and a location reported by Word mean the same file."""
+    def norm(text):
+        return unicodedata.normalize("NFC", text)
+    if not place:
+        return False
+    if "://" in entry or "://" in place:
+        return norm(urllib.parse.unquote(entry)).rstrip("/") == norm(urllib.parse.unquote(place)).rstrip("/")
+    wanted = os.path.expanduser(entry)
+    try:
+        if os.path.exists(wanted) and os.path.exists(place):
+            return os.path.samefile(wanted, place)
+    except OSError:
+        pass
+    return norm(os.path.realpath(wanted)) == norm(os.path.realpath(place))
+
+
+def open_documents():
+    """The documents open in Word, as {file name: [locations]}. A name with more than one location is open more than once.
+    A location of None marks a document that Word can no longer find by name."""
+    rest = run_word("list")
+    doc_part, _, win_part = rest.partition(GS)
+    counts, by_doc, by_window = {}, {}, {}
+    for row in doc_part.split(RS):
+        if row:
+            name, place, reachable = (row.split(US) + ["", "1"])[:3]
+            counts[name] = counts.get(name, 0) + 1
+            by_doc.setdefault(name, []).append(place if reachable == "1" else None)
+    for row in win_part.split(RS):
+        if row:
+            name, _, place = row.partition(US)
+            if place not in by_window.setdefault(name, []):
+                by_window[name].append(place)
+    opened = {}
+    for name, n in counts.items():
+        if n == 1:
+            opened[name] = by_doc[name][:1]
+        else:
+            # By name, Word reports the same document n times; the windows show the real locations
+            places = by_window.get(name, [])
+            opened[name] = places if len(places) >= n else places + [""] * (n - len(places))
+    return opened
+
+
+def doc_state(name, entries, opened):
+    """How the allowed document of this name stands in Word: (state, location). States: closed, duplicate, wrong_file, ok."""
+    places = opened.get(name, [])
+    if not places:
+        return "closed", ""
+    if len(places) > 1:
+        return "duplicate", ""
+    place = places[0]
+    if place is None:
+        return "lost", ""
+    if any(not is_location(e) or same_location(e, place) for e in entries):
+        return "ok", place
+    return "wrong_file", place
+
+
+def check_doc(requested):
+    """Check a tool's document argument against the allow-list and against what is open in Word.
+
+    Returns (config, document spec for word_ops). The spec carries the location seen now, so that the script
+    refuses if a different document of the same name has taken its place by the time it runs."""
     cfg = load_config()
     allowed = cfg.get("allowed_documents", [])
-    if name not in allowed:
+    name = entry_name(requested) if is_location(requested) else requested
+    entries = [e for e in allowed if entry_name(e) == name]
+    if is_location(requested):
+        entries = [e for e in entries if is_location(e) and same_location(e, os.path.expanduser(requested))]
+    if not entries:
+        names = sorted({entry_name(e) for e in allowed})
         raise ToolError(
-            f"Document {name!r} is not on the allow-list. Allowed documents: {', '.join(allowed)}. "
+            f"Document {requested!r} is not on the allow-list. Allowed documents: {', '.join(names)}. "
             "To add one, ask the user to edit ~/.word-bridge/config.json on the Mac.")
-    return cfg
+    state, place = doc_state(name, entries, open_documents())
+    if state == "closed":
+        raise ToolError(explain_error("not_open", ""), "not_open")
+    if state == "duplicate":
+        raise ToolError(DUPLICATE_REFUSAL, "duplicate_name")
+    if state == "wrong_file":
+        raise ToolError(WRONG_FILE_REFUSAL, "wrong_file")
+    if state == "lost":
+        raise ToolError(LOST_REFUSAL, "lost_document")
+    return cfg, name + GS + place
 
 
 def to_word(text):
@@ -207,20 +343,24 @@ def paragraphs_of(text):
 def tool_list_documents(args):
     cfg = load_config()
     allowed = cfg.get("allowed_documents", [])
-    rest = run_word("list")
-    opened = [n for n in rest.split(RS) if n]
+    opened = open_documents()
+    notes = {"closed": "not open", "ok": "open in Word",
+             "duplicate": "open more than once under this name; the user has to close one copy before it can be read or edited",
+             "wrong_file": "a document of this name is open, but it is a different file from the allowed one",
+             "lost": "open, but Word's scripting interface has lost track of it; the user has to close it and open it again"}
     lines = ["Allowed documents and their state:"]
-    for name in allowed:
-        lines.append(f"- {name}: {'open in Word' if name in opened else 'not open'}")
+    for name in dict.fromkeys(entry_name(e) for e in allowed):
+        state, _ = doc_state(name, [e for e in allowed if entry_name(e) == name], opened)
+        lines.append(f"- {name}: {notes[state]}")
     return "\n".join(lines)
 
 
 def tool_read_document(args):
     name = args["document"]
-    check_doc(name)
+    _, spec = check_doc(name)
     start = max(1, int(args.get("start_paragraph", 1)))
     count = max(1, min(200, int(args.get("max_paragraphs", 40))))
-    info = read_doc(name)
+    info = read_doc(spec)
     paras = paragraphs_of(info["text"])
     chunk = paras[start - 1:start - 1 + count]
     head = (f"Document {name}: {len(paras)} paragraphs, {info['revisions']} pending revisions, {info['comments']} comments, "
@@ -233,13 +373,13 @@ def tool_read_document(args):
 
 def tool_find_text(args):
     name = args["document"]
-    check_doc(name)
+    _, spec = check_doc(name)
     query = to_word(args["query"])
     if not query:
         raise ToolError("query must not be empty.")
     ctx = max(0, min(300, int(args.get("context_chars", 60))))
     max_results = max(1, min(50, int(args.get("max_results", 20))))
-    text = read_doc(name)["text"]
+    text = read_doc(spec)["text"]
     hits, pos = [], text.find(query)
     while pos != -1:
         hits.append(pos)
@@ -257,41 +397,127 @@ def tool_find_text(args):
     return "\n".join(lines)
 
 
-def do_edit(name, find, prefix, middle_old, middle_new, occurrence, cfg, kind):
-    rest = run_word("edit", name, find, prefix, middle_old, middle_new, occurrence, cfg.get("author", "Claude"))
-    n, p, q, n_rev = rest.split(US)
-    audit({"tool": kind, "document": name, "find": find, "deleted": middle_old, "inserted": middle_new,
-           "occurrence": occurrence, "position": [int(p), int(q)]})
-    return int(n_rev)
+def split_around_fields(find, replace, fields):
+    """Split the change from find to replace into parts that leave the fields inside find untouched.
+
+    fields: (visible text between the start of find and the field's result, the result text) for each field.
+    Returns a list of (prefix, old, new), or None when replace does not keep every field's text in place."""
+    spans = []
+    for lead, shown in fields:
+        a, b = len(lead), len(lead) + len(shown)
+        if not shown or find[:a] != lead or find[a:b] != shown or (spans and a < spans[-1][1]):
+            return None
+        spans.append((a, b))
+    blocks = difflib.SequenceMatcher(None, find, replace, autojunk=False).get_matching_blocks()
+    mapped = []
+    for a, b in spans:
+        hit = next((blk for blk in blocks if blk.a <= a and b <= blk.a + blk.size), None)
+        if hit is None:
+            return None
+        new_a = hit.b + (a - hit.a)
+        mapped.append((a, b, new_a, new_a + (b - a)))
+    mapped.append((len(find), len(find), len(replace), len(replace)))
+    segments = []
+    old_at = new_at = 0
+    for a, b, new_a, new_b in mapped:
+        if new_a < new_at:
+            return None
+        old_piece, new_piece = find[old_at:a], replace[new_at:new_a]
+        if old_piece != new_piece:
+            lead, middle_old, middle_new = tight_diff(old_piece, new_piece)
+            segments.append((find[:old_at] + lead, middle_old, middle_new))
+        old_at, new_at = b, new_b
+    return segments or None
+
+
+def run_edit(spec, find, segments, occurrence, cfg, expect_after, allow_fields):
+    flat = [part for seg in segments for part in seg]
+    rest = run_word("edit", spec, find, occurrence, cfg.get("author", "Claude"), "1" if allow_fields else "0",
+                    expect_after, len(segments), *flat)
+    n, positions, n_rev, post, ctx_a, ctx_b = rest.split(US, 5)
+    return {"positions": [[int(x) for x in pair.split("-")] for pair in positions.split(",") if pair],
+            "revisions": int(n_rev), "verified": post == "ok", "before": ctx_a, "after": ctx_b}
+
+
+def apply_edit(spec, find, replace, segments, occurrence, cfg, kind, allow_fields=False):
+    """Write the segments as tracked changes. Fields are protected first; allow_fields is only used when that fails."""
+    kept_fields = 0
+    try:
+        res = run_edit(spec, find, segments, occurrence, cfg, replace, False)
+    except ToolError as exc:
+        if exc.code == "field_in_range":
+            fields = [tuple((row.split(GS) + [""])[:2]) for row in exc.detail.split(RS) if row]
+            split = split_around_fields(find, replace, fields)
+            if split:
+                segments, kept_fields = split, len(fields)
+                res = run_edit(spec, find, segments, occurrence, cfg, replace, False)
+            elif allow_fields:
+                res = run_edit(spec, find, segments, occurrence, cfg, replace, True)
+            else:
+                raise
+        elif exc.code == "in_field" and allow_fields:
+            res = run_edit(spec, find, segments, occurrence, cfg, replace, True)
+        else:
+            raise
+    name, _, place = spec.partition(GS)
+    audit({"tool": kind, "document": name, "location": place, "find": find, "occurrence": occurrence,
+           "changes": [{"deleted": old, "inserted": new, "position": pos}
+                       for (_, old, new), pos in zip(segments, res["positions"])],
+           "verified": res["verified"]})
+    res["segments"] = segments
+    res["kept_fields"] = kept_fields
+    return res
+
+
+def visible(text):
+    return text.replace("\r", "⏎")
+
+
+def readback_note(res, new_text):
+    """What the passage reads like after the write, or a warning when the read-back did not match."""
+    if not res["verified"]:
+        return ("\nWARNING: the change was written, but when the document was read back its text did not match what this edit should have produced. "
+                "The change may have landed in the wrong place, or the user may have been typing at the same moment. "
+                "Stop editing this document, look for the new text with word_find_text, and tell the user.")
+    shown = new_text if len(new_text) <= 320 else new_text[:150] + " … " + new_text[-150:]
+    return f"\nVerified by reading the document back. The passage now reads: …{visible(res['before'])}«{visible(shown)}»{visible(res['after'])}…"
 
 
 def tool_replace_text(args):
     name = args["document"]
-    cfg = check_doc(name)
+    cfg, spec = check_doc(name)
     find = to_word(args["find"])
     replace = to_word(args.get("replace", ""))
     occurrence = max(0, int(args.get("occurrence", 0)))
+    allow_fields = bool(args.get("allow_field_changes", False))
     if not find:
         raise ToolError("find must not be empty. Use word_insert_text to insert text.")
     if find == replace:
         raise ToolError("find and replace are identical, so there is nothing to change.")
     prefix, middle_old, middle_new = tight_diff(find, replace)
     try:
-        n_rev = do_edit(name, find, prefix, middle_old, middle_new, occurrence, cfg, "replace_text")
+        res = apply_edit(spec, find, replace, [(prefix, middle_old, middle_new)], occurrence, cfg, "replace_text", allow_fields)
     except ToolError as exc:
         # If verification fails on the tightened range, fall back once to replacing the whole match
         if exc.code != "verify_failed" or (prefix == "" and middle_old == find):
             raise
-        n_rev = do_edit(name, find, "", find, replace, occurrence, cfg, "replace_text")
-        middle_old, middle_new = find, replace
-    what = "Deleted" if middle_new == "" else ("Inserted" if middle_old == "" else "Replaced")
-    return (f"{what} as a tracked change. Deleted: {middle_old!r}; inserted: {middle_new!r}. "
-            f"The document now has {n_rev} pending revisions for the user to review.")
+        res = apply_edit(spec, find, replace, [("", find, replace)], occurrence, cfg, "replace_text", allow_fields)
+    segments = res["segments"]
+    if len(segments) == 1:
+        _, middle_old, middle_new = segments[0]
+        what = "Deleted" if middle_new == "" else ("Inserted" if middle_old == "" else "Replaced")
+        head = f"{what} as a tracked change. Deleted: {middle_old!r}; inserted: {middle_new!r}."
+    else:
+        parts = "; ".join(f"({i}) deleted {old!r}, inserted {new!r}" for i, (_, old, new) in enumerate(segments, 1))
+        head = (f"Changed {len(segments)} separate pieces as tracked changes, leaving the {res['kept_fields']} field(s) "
+                f"(citations or links) between them untouched: {parts}.")
+    return (f"{head} The document now has {res['revisions']} pending revisions for the user to review."
+            + readback_note(res, replace))
 
 
 def tool_insert_text(args):
     name = args["document"]
-    cfg = check_doc(name)
+    cfg, spec = check_doc(name)
     anchor = to_word(args["anchor"])
     text = to_word(args["text"])
     where = args.get("position", "after")
@@ -301,30 +527,31 @@ def tool_insert_text(args):
     if where not in ("after", "before"):
         raise ToolError("position must be after or before.")
     prefix = anchor if where == "after" else ""
-    n_rev = do_edit(name, anchor, prefix, "", text, occurrence, cfg, "insert_text")
+    now_reads = anchor + text if where == "after" else text + anchor
+    res = apply_edit(spec, anchor, now_reads, [(prefix, "", text)], occurrence, cfg, "insert_text")
     return (f"Inserted as a tracked change {'after' if where == 'after' else 'before'} the anchor text: {text!r}. "
-            f"The document now has {n_rev} pending revisions.")
+            f"The document now has {res['revisions']} pending revisions." + readback_note(res, now_reads))
 
 
 def tool_add_comment(args):
     name = args["document"]
-    cfg = check_doc(name)
+    cfg, spec = check_doc(name)
     anchor = to_word(args["anchor"])
     comment = args["comment"]
     occurrence = max(0, int(args.get("occurrence", 0)))
     if not anchor or not comment:
         raise ToolError("anchor and comment must not be empty.")
-    rest = run_word("comment", name, anchor, occurrence, comment, cfg.get("author", "Claude"))
+    rest = run_word("comment", spec, anchor, occurrence, comment, cfg.get("author", "Claude"))
     _, n_com = rest.split(US)
-    audit({"tool": "add_comment", "document": name, "anchor": anchor, "comment": comment, "occurrence": occurrence})
+    audit({"tool": "add_comment", "document": name, "location": spec.partition(GS)[2], "anchor": anchor, "comment": comment, "occurrence": occurrence})
     return f"Comment added on that text. The document now has {n_com} comments."
 
 
 def tool_list_changes(args):
     name = args["document"]
-    check_doc(name)
+    _, spec = check_doc(name)
     max_items = max(1, min(300, int(args.get("max_items", 100))))
-    rest = run_word("revisions", name, max_items)
+    rest = run_word("revisions", spec, max_items)
     head, _, body = rest.partition(RS)
     n_rev, n_com = head.split(US)
     rev_part, _, com_part = body.partition(GS)
@@ -415,8 +642,8 @@ def clean_context(text):
     return text.replace("\r", "⏎").replace("\x07", " ").replace("\x01", "").strip()
 
 
-def list_images(name):
-    rest = run_word("images", name)
+def list_images(spec):
+    rest = run_word("images", spec)
     head, _, body = rest.partition(RS)
     n_inline, n_floating = (int(x) for x in head.split(US)[:2])
     images = []
@@ -429,8 +656,8 @@ def list_images(name):
 
 def tool_list_images(args):
     name = args["document"]
-    check_doc(name)
-    n_inline, n_floating, images = list_images(name)
+    _, spec = check_doc(name)
+    n_inline, n_floating, images = list_images(spec)
     lines = [f"Document {name}: {n_inline} inline pictures" + (f", plus {n_floating} floating pictures (cannot be replaced)" if n_floating else "") + "."]
     for img in images:
         state = " (tracked-deleted, waiting for the user to accept)" if img["deleted"] else ""
@@ -445,7 +672,7 @@ def tool_list_images(args):
 
 def tool_replace_image(args):
     name = args["document"]
-    cfg = check_doc(name)
+    cfg, spec = check_doc(name)
     data_b64 = args.get("image_data")
     if not data_b64:
         raise ToolError("This call carried no image data. The image is read by client.py on the remote side and sent with the call; make sure client.py on the remote host is up to date.")
@@ -460,7 +687,7 @@ def tool_replace_image(args):
         raise ToolError("The data received is not a PNG. Provide a PNG, or a PDF for the remote side to render to PNG.")
     px_w, px_h, dpi = info
 
-    n_inline, _, images = list_images(name)
+    n_inline, _, images = list_images(spec)
     live = [img for img in images if not img["deleted"]]
     index = int(args.get("image_index") or 0)
     near = to_word(args.get("near_text") or "")
@@ -476,7 +703,7 @@ def tool_replace_image(args):
         side = args.get("side", "above")
         if side not in ("above", "below"):
             raise ToolError("side must be above (the picture is above the anchor text) or below (the picture is below it).")
-        rest = run_word("locate", name, near, max(0, int(args.get("occurrence", 0))))
+        rest = run_word("locate", spec, near, max(0, int(args.get("occurrence", 0))))
         anchor_pos = int(rest.split(US)[1])
         if side == "above":
             candidates = [img for img in live if img["start"] < anchor_pos]
@@ -490,9 +717,9 @@ def tool_replace_image(args):
         raise ToolError("Say which picture to replace with image_index or near_text.")
 
     with serve_image(data) as url:
-        rest = run_word("replaceimage", name, target["index"], target["start"], url, cfg.get("author", "Claude"), timeout=240)
+        rest = run_word("replaceimage", spec, target["index"], target["start"], url, cfg.get("author", "Claude"), timeout=240)
     old_w, old_h, _, _, new_w, new_h, n_rev = rest.split(US)
-    audit({"tool": "replace_image", "document": name, "index": target["index"], "image": args.get("image_name"),
+    audit({"tool": "replace_image", "document": name, "location": spec.partition(GS)[2], "index": target["index"], "image": args.get("image_name"),
            "source": args.get("image_path"), "bytes": len(data), "pixels": [px_w, px_h], "dpi": dpi})
     note = args.get("image_note") or ""
     below = clean_context(target["below"]).lstrip("/⏎ ")[:60]
@@ -532,16 +759,19 @@ TOOLS = [
     {"name": "word_replace_text",
      "description": ("Replace a piece of text with another as a tracked change; it shows up at once in the Word window the user has open. "
                      "An empty replace deletes the text. find must match the document character for character and be unique (or be picked with occurrence). "
-                     "Only the part that actually differs between find and replace is marked as a revision."),
+                     "Only the part that actually differs between find and replace is marked as a revision. "
+                     "A citation or other field inside find is left untouched as long as replace keeps its visible text; the result shows the passage as read back from Word."),
      "inputSchema": {"type": "object", "properties": {
          "document": DOC_PROP,
          "find": {"type": "string", "description": "Existing text in the document, with enough context to be unique."},
          "replace": {"type": "string", "description": "The replacement text. An empty string deletes."},
-         "occurrence": OCC_PROP},
+         "occurrence": OCC_PROP,
+         "allow_field_changes": {"type": "boolean", "description": "Set to true only to delete or overwrite a field (a citation, cross-reference or hyperlink) covered by find on purpose. Default false: such an edit is refused.", "default": False}},
          "required": ["document", "find", "replace"]},
      "handler": tool_replace_text},
     {"name": "word_insert_text",
-     "description": "Insert new text after (or before) an anchor text, as a tracked change. Use a line break in text to start a new paragraph.",
+     "description": ("Insert new text after (or before) an anchor text, as a tracked change. Use a line break in text to start a new paragraph. "
+                     "Next to a citation or other field the text goes outside the field; the result shows the passage as read back from Word."),
      "inputSchema": {"type": "object", "properties": {
          "document": DOC_PROP,
          "anchor": {"type": "string", "description": "Existing text in the document used as the anchor (matching character for character, and unique)."},
@@ -715,7 +945,27 @@ def tunnel_keeper():
 
 # ---------------------------------------------------------------- Entry point
 
+def print_open_documents():
+    """For the user: the open documents and the location string that pins each one in allowed_documents."""
+    opened = open_documents()
+    if not opened:
+        print("No document is open in Word.")
+        return
+    print("Documents open in Word. To pin an allow-list entry to one file, put its location in allowed_documents instead of the bare name.")
+    for name, places in opened.items():
+        note = "   (open more than once: the bridge refuses this name until one copy is closed)" if len(places) > 1 else ""
+        print(f"\n  {name}{note}")
+        for place in places:
+            print("      " + ("(Word has lost track of this document; close it and open it again)" if place is None else place or "(not saved yet)"))
+
+
 def main():
+    if "--list-open" in sys.argv:
+        try:
+            print_open_documents()
+        except ToolError as exc:
+            sys.exit(str(exc))
+        return
     os.umask(0o077)
     cfg = load_config()
     token = load_token()
@@ -726,7 +976,7 @@ def main():
     server.bind(sock_path)
     os.chmod(sock_path, 0o600)
     server.listen(8)
-    log(f"word-bridge listening on {sock_path}; allowed documents: {cfg.get('allowed_documents')}")
+    log(f"word-bridge listening on {sock_path}; allowed documents: {[entry_name(e) for e in cfg.get('allowed_documents', [])]}")
     if "--no-tunnel" not in sys.argv:
         threading.Thread(target=tunnel_keeper, daemon=True).start()
     while True:

@@ -74,7 +74,7 @@ scripts/install-mac.sh
 
 This copies the code to `~/.word-bridge`, generates an access token, and creates `config.json` from the example. Edit `~/.word-bridge/config.json`:
 
-- `allowed_documents`: file names the agent may touch
+- `allowed_documents`: the documents the agent may touch. A bare file name (`report.docx`) matches any open document with that name. A full path (`~/Documents/paper/report.docx`), or the URL Word shows for a OneDrive or SharePoint document, pins the entry to that one file. `/usr/bin/python3 ~/.word-bridge/server.py --list-open` prints the location of every open document in the form to use here.
 - `ssh_host`: the `Host` in your `~/.ssh/config` where Claude Code runs
 - `remote_socket`: where the tunnel should appear on that host (the next step prints the right value)
 
@@ -117,6 +117,15 @@ The first time the server talks to Word, macOS may ask whether to allow it to co
 
 **Word may shrink the picture when it saves.** Unless picture compression is turned off for the document, Word downsamples pictures to about 220 ppi on save; in our test a 6375-pixel-wide figure was stored at 440 pixels. To keep the full resolution, tick "Do not compress images in file" under Word > Preferences > Edit > Image Size and Quality for that document. The bridge cannot read or change this setting.
 
+## Citations and other fields
+
+A manuscript managed with a reference manager is full of fields: every citation carries a few thousand characters of hidden code, and the bibliography is one large field. The bridge treats them as follows.
+
+- Text next to a citation can be edited, and the citation stays a live field. A replacement that spans a citation is written as separate tracked changes on either side of it, provided the new text keeps the citation's visible text (its number or label) in place.
+- Inserted text never lands inside a field. Next to a citation it goes just before or just after the field.
+- An edit that would rewrite or delete a field, or that falls inside what a field displays (the bibliography, a table of contents, a cross-reference, a hyperlink), is refused. Pass `allow_field_changes: true` to `word_replace_text` to do it anyway.
+- Every write is checked twice. Before writing, the text at the computed position is read back and compared with the text to change. After writing, the whole document is read again and compared with the expected result. The tool result shows the passage as it now reads, or a warning if the two differ.
+
 ## The SSH tunnel
 
 The server keeps a reverse tunnel alive by itself. It only ever rides the SSH master connection you already opened; if that connection is gone it does nothing and never tries to authenticate. This matters on hosts that need a one-time password: after you log in again, the tunnel is back within about 30 seconds.
@@ -134,7 +143,7 @@ Host myserver
 
 - The Mac socket and the remote socket are Unix sockets readable only by you (`0600` inside a `0700` directory). On a shared login or compute node, other users cannot connect.
 - Every connection must present the token before anything else is processed.
-- Only documents named in `allowed_documents`, and currently open in Word, can be read or edited.
+- Only documents named in `allowed_documents`, and currently open in Word, can be read or edited. An entry given as a path or URL allows that one file only: another file with the same name is refused.
 - All writes are logged to `~/.word-bridge/audit.log`.
 - While a picture is being replaced, it is served on `127.0.0.1` at a random port under a one-time random path, and the listener is closed as soon as Word has fetched it.
 - The agent can read the text of allowed documents. Do not allow documents you would not show it.
@@ -142,8 +151,8 @@ Host myserver
 ## Limitations
 
 - **No table structure or layout changes.** Tables are read as flattened text. Pictures can only be replaced whole, and only inline pictures (not floating ones).
-- **Matching is exact.** The anchor text must match character for character and be unique, or the call is refused. Anchors that contain citation fields, footnote marks or existing revisions may fail the verification step; the bridge then makes no change.
-- **Documents are matched by file name, not path.** Two files with the same name are indistinguishable.
+- **Matching is exact.** The anchor text must match character for character and be unique, or the call is refused. Anchors with a footnote mark or an existing revision at their edge may fail the verification step; the bridge then makes no change.
+- **One open document per file name.** Word's scripting interface cannot address two open documents with the same file name separately: it resolves both to the same one. The bridge therefore refuses that name until one copy is closed. Word may then need the remaining document closed and reopened before scripts can find it again; the bridge says so when that happens.
 - **Authorship is set by briefly switching Word's user name** during each write and restoring it afterwards. If you type in that instant, your keystrokes may be attributed to the agent.
 - **Reading excludes tracked deletions.** The text is what you would get after accepting all changes.
 - **Tested on one setup:** Word for Mac 16.114, macOS client with OpenSSH 10, a Linux remote host, Claude Code 2.1. Word for Windows is not supported (the bridge uses AppleScript).
