@@ -50,6 +50,7 @@ Microsoft Word              打开的窗口立刻更新
 | `word_replace_text` | 以修订模式替换文字（替换为空即删除） |
 | `word_insert_text` | 以修订模式在定位文字前后插入 |
 | `word_add_comment` | 在一段文字上加批注 |
+| `word_format_text` | 把文字设为粗体、斜体、下划线、字体颜色、高亮、上标或下标（或取消），记为格式修订 |
 | `word_list_images` | 列出嵌入式图片，以及每张的尺寸和上下方文字 |
 | `word_insert_image` | 以修订模式在定位文字旁插入一张新图片 |
 | `word_replace_image` | 以修订模式把一张图片整张替换成新图 |
@@ -108,6 +109,15 @@ scripts/install-mac.sh --launch-agent
 ```json
 { "permissions": { "allow": ["mcp__word-bridge__word_read_document", "mcp__word-bridge__word_replace_text"] } }
 ```
+
+## 格式
+
+`word_format_text` 只改文字的样子，不动文字本身：粗体、斜体、单下划线、字体颜色（任意十六进制 RGB，或恢复为自动）、高亮（Word 的高亮色，或去掉）、上标和下标。每项都可以开或关，一次调用可以同时改几项。
+
+- **选定文字。** `find` 和其他工具一样用来定位段落；`target` 是其中要改格式的那一部分，这样常见词也能借助上下文只选中其中一处。
+- **记为修订。** Word 会把它记成格式修订（页边显示"带格式的: 字体: 加粗"之类）。bridge 事后会检查这条修订是否存在。如果 Word 改了格式却没有记录（Word 修订选项里的"跟踪格式"关闭时会这样），结果会给出警告。AppleScript 既读不到也改不了这个选项。
+- **读回校验。** 每项格式都会从 Word 读回并与要求比对，文档文字也会与调用前比对。文字已经具备的格式会跳过并在结果中说明。
+- **保护。** 公式会被拒绝。引文等域也会被拒绝，因为 Word 或文献管理软件会重新生成域的文字，手动设置的格式会丢失；传入 `allow_field_changes: true` 可以强制修改。
 
 ## 图片
 

@@ -277,6 +277,86 @@ on hasAnyOf(s, charSet)
 	return false
 end hasAnyOf
 
+-- "1" for true, "0" for false, anything else (a range with mixed formatting) as text
+on flag(x)
+	if x is true then return "1"
+	if x is false then return "0"
+	try
+		return (x as text)
+	on error
+		return "mixed"
+	end try
+end flag
+
+-- Word's highlight colour for a name sent by server.py; none removes the highlight
+on highlightConst(nm)
+	tell application "Microsoft Word"
+		if nm is "yellow" then return yellow
+		if nm is "bright green" then return bright green
+		if nm is "turquoise" then return turquoise
+		if nm is "pink" then return pink
+		if nm is "blue" then return blue
+		if nm is "red" then return red
+		if nm is "dark blue" then return dark blue
+		if nm is "teal" then return teal
+		if nm is "green" then return green
+		if nm is "violet" then return violet
+		if nm is "dark red" then return dark red
+		if nm is "dark yellow" then return dark yellow
+		if nm is "gray50" then return gray50
+		if nm is "gray25" then return gray25
+		if nm is "black" then return black
+		return no highlight
+	end tell
+end highlightConst
+
+-- The current value of one formatting property of [p,q), in the form server.py sends it (1/0, 16-bit "r,g,b", auto, a highlight name, none)
+on readProp(d, p, q, propKey, propVal)
+	try
+		tell application "Microsoft Word"
+			set r to create range d start p end q
+			if propKey is "bold" then return my flag(bold of font object of r)
+			if propKey is "italic" then return my flag(italic of font object of r)
+			if propKey is "superscript" then return my flag(superscript of font object of r)
+			if propKey is "subscript" then return my flag(subscript of font object of r)
+			if propKey is "underline" then
+				set u to underline of font object of r
+				if u is underline none then return "0"
+				if u is underline single then return "1"
+				return (u as text)
+			end if
+			if propKey is "color" then
+				if propVal is "auto" then
+					if (color index of font object of r) is no highlight then return "auto"
+					return ((color index of font object of r) as text)
+				end if
+				set c to color of font object of r
+				return ((item 1 of c) as text) & "," & ((item 2 of c) as text) & "," & ((item 3 of c) as text)
+			end if
+			if propKey is "highlight" then
+				set h to highlight color index of r
+				if h is (my highlightConst(propVal)) then return propVal
+				return (h as text)
+			end if
+		end tell
+	on error errMsg
+		return "error: " & errMsg
+	end try
+	return ""
+end readProp
+
+-- The type of the first revision that touches [p,q), or "" when there is none.
+-- (count of revisions of a range always answers 0, but revision 1 of a range works.)
+on revisionAt(d, p, q)
+	try
+		tell application "Microsoft Word"
+			return ((revision type of (revision 1 of (create range d start p end q))) as text)
+		end tell
+	on error
+		return ""
+	end try
+end revisionAt
+
 -- Where to insert between two visible characters of the located text [pS,pE): prefixText is the part of findText in front of the point.
 -- Checks the text on both sides, then picks a position outside every field.
 -- Returns {status, position, detail}; status is "ok", "verify_failed" or "in_field".
@@ -638,6 +718,132 @@ on run argv
 					set nc to count of Word comments of d
 				end tell
 				return "OK" & my fieldSep & n & my fieldSep & nc
+
+			else if op is "format" then
+				-- argv: format doc findText occurrence author allowFields prefixText targetText nProps  then nProps items key=value
+				-- Formats targetText, which follows prefixText inside findText, as a tracked formatting change. The text itself is not touched.
+				-- Keys: bold, italic, underline, superscript, subscript (1 or 0), color (16-bit "r,g,b" or auto), highlight (a name or none).
+				-- A property the text already has is left alone and reported back.
+				set findText to item 3 of argv
+				set occ to (item 4 of argv) as integer
+				set authorName to item 5 of argv
+				set allowFields to ((item 6 of argv) is "1")
+				set prefixText to item 7 of argv
+				set targetText to item 8 of argv
+				set nProps to (item 9 of argv) as integer
+				set fmtKeys to {}
+				set fmtVals to {}
+				repeat with i from 1 to nProps
+					set AppleScript's text item delimiters to "="
+					set kv to text items of (item (9 + i) of argv)
+					set AppleScript's text item delimiters to ""
+					set end of fmtKeys to item 1 of kv
+					set end of fmtVals to item 2 of kv
+				end repeat
+				set {locStatus, n, k, t, docEnd, excess} to my locateVisible(d, findText, occ)
+				if locStatus is not "ok" then return "ERR" & my fieldSep & locStatus & my fieldSep & n
+				set pS to my posForVisible(d, k, docEnd, excess)
+				set pE to my endForVisible(d, pS, (count of findText), docEnd)
+				set got to my readRange(d, pS, pE)
+				if not (my textsEqual(got, findText)) then return my anchorMismatch(d, pS, pE, got)
+				-- The target: from its first visible character to right after its last one
+				set p to my startForVisible(d, pS, (count of prefixText), docEnd)
+				set q to my endForVisible(d, p, (count of targetText), docEnd)
+				set got to my readRange(d, p, q)
+				if not (my textsEqual(got, targetText)) then return my anchorMismatch(d, p, q, got)
+				if (my countMath(d, p, q)) > 0 then return "ERR" & my fieldSep & "equation_in_range" & my fieldSep & got
+				set nFields to my countFields(d, 0, docEnd)
+				if nFields > 0 and not allowFields then
+					-- A field's result is regenerated by Word or by Zotero, which drops formatting set on it by hand
+					if (my countFields(d, p, q)) > 0 then return "ERR" & my fieldSep & "format_field" & my fieldSep & got
+					if (my fieldDepth(d, p, docEnd, nFields)) > 0 then return "ERR" & my fieldSep & "format_field" & my fieldSep & got
+				end if
+				-- What the text has now: properties already as wanted are skipped
+				set todo to {}
+				set already to {}
+				repeat with i from 1 to nProps
+					if (my readProp(d, p, q, item i of fmtKeys, item i of fmtVals)) is (item i of fmtVals) then
+						set end of already to item i of fmtKeys
+					else
+						set end of todo to i
+					end if
+				end repeat
+				set hadRev to my revisionAt(d, p, q)
+				tell application "Microsoft Word"
+					set nr0 to count of revisions of d
+				end tell
+				if (count of todo) is 0 then
+					return "OK" & my fieldSep & n & my fieldSep & p & "-" & q & my fieldSep & nr0 & my fieldSep & nr0 & my fieldSep & "1" & my fieldSep & "" & my fieldSep & (my joinList(already, (character id 29))) & my fieldSep & hadRev & my fieldSep & hadRev & my fieldSep & "" & my fieldSep & ""
+				end if
+				tell application "Microsoft Word"
+					set oldName to user name
+					set track revisions of d to true
+					set nDone to 0
+					try
+						if authorName is not "" then set user name to authorName
+						set r to create range d start p end q
+						repeat with i in todo
+							set propKey to item i of fmtKeys
+							set propVal to item i of fmtVals
+							if propKey is "bold" then
+								set bold of font object of r to (propVal is "1")
+							else if propKey is "italic" then
+								set italic of font object of r to (propVal is "1")
+							else if propKey is "underline" then
+								if propVal is "1" then
+									set underline of font object of r to underline single
+								else
+									set underline of font object of r to underline none
+								end if
+							else if propKey is "superscript" then
+								set superscript of font object of r to (propVal is "1")
+							else if propKey is "subscript" then
+								set subscript of font object of r to (propVal is "1")
+							else if propKey is "color" then
+								if propVal is "auto" then
+									-- The term auto compiles to another enumeration's constant; WdColorIndex auto has the same code as no highlight
+									set color index of font object of r to no highlight
+								else
+									set AppleScript's text item delimiters to ","
+									set rgbParts to text items of propVal
+									set AppleScript's text item delimiters to ""
+									set color of font object of r to {(item 1 of rgbParts) as integer, (item 2 of rgbParts) as integer, (item 3 of rgbParts) as integer}
+								end if
+							else if propKey is "highlight" then
+								set highlight color index of r to (my highlightConst(propVal))
+							end if
+							set nDone to nDone + 1
+						end repeat
+						set user name to oldName
+					on error errMsg
+						set user name to oldName
+						return "ERR" & my fieldSep & "write_failed" & my fieldSep & nDone & my fieldSep & errMsg
+					end try
+					set nr1 to count of revisions of d
+					set t2 to content of text object of d
+				end tell
+				set hasRev to my revisionAt(d, p, q)
+				-- Read every property back from the same range
+				set checks to {}
+				repeat with i from 1 to nProps
+					set end of checks to (item i of fmtKeys) & "=" & (my readProp(d, p, q, item i of fmtKeys, item i of fmtVals))
+				end repeat
+				set sameText to "1"
+				if not (my textsEqual(t2, t)) then set sameText to "0"
+				set ctxA to ""
+				if k > 0 then
+					set ctxFrom to k - 59
+					if ctxFrom < 1 then set ctxFrom to 1
+					set ctxA to text ctxFrom thru k of t
+				end if
+				set ctxB to ""
+				set kEnd to k + (count of findText)
+				if kEnd < (count of t) then
+					set ctxTo to kEnd + 60
+					if ctxTo > (count of t) then set ctxTo to (count of t)
+					set ctxB to text (kEnd + 1) thru ctxTo of t
+				end if
+				return "OK" & my fieldSep & n & my fieldSep & p & "-" & q & my fieldSep & nr0 & my fieldSep & nr1 & my fieldSep & sameText & my fieldSep & (my joinList(checks, (character id 29))) & my fieldSep & (my joinList(already, (character id 29))) & my fieldSep & hadRev & my fieldSep & hasRev & my fieldSep & ctxA & my fieldSep & ctxB
 
 			else if op is "revisions" then
 				set maxN to (item 3 of argv) as integer

@@ -41,7 +41,7 @@ AUDIT_PATH = os.path.join(BASE, "audit.log")
 SCRIPT_PATH = os.path.join(BASE, "word_ops.applescript")
 
 US, RS, GS = "\x1f", "\x1e", "\x1d"
-SERVER_INFO = {"name": "word-bridge", "version": "1.5.0"}
+SERVER_INFO = {"name": "word-bridge", "version": "1.6.0"}
 MAX_IMAGE_BYTES = 120 * 1024 * 1024
 KNOWN_PROTOCOLS = ("2025-06-18", "2025-03-26", "2024-11-05")
 
@@ -70,7 +70,10 @@ INSTRUCTIONS = (
     "in a document with many equations they are not grouped, and each reads as short fragments, often in mathematical italic letters, on lines of their own. "
     "Never use an equation's text or the brackets as find or anchor, and do not edit inside it. "
     "To correct an equation, remove it with word_delete_equation and insert a new one. "
-    "The read-back cannot show whether a formula looks right, so tell the user which formula you put where."
+    "The read-back cannot show whether a formula looks right, so tell the user which formula you put where.\n"
+    "10. Formatting: word_format_text makes text bold, italic, underlined, coloured, highlighted, superscript or subscript (or undoes that) "
+    "as a tracked formatting change, without touching the text. Text you read carries no formatting, so ask the user or look at the passage's meaning "
+    "when it matters what the formatting is now. Do not delete and retype text only to change its formatting."
 )
 
 word_lock = threading.Lock()
@@ -161,6 +164,10 @@ def explain_error(code, detail):
                 "To change the field's own text on purpose, call word_replace_text with allow_field_changes=true.")
     if code == "field_in_range":
         return FIELD_REFUSAL
+    if code == "format_field":
+        return ("The text to format is or includes a field (a citation, the bibliography, a cross-reference or a hyperlink), so nothing was changed. "
+                "Word or Zotero regenerates what a field shows and would drop formatting set on it by hand. "
+                "Format the text next to the field instead, or pass allow_field_changes=true to format it anyway.")
     if code == "in_equation":
         return ("This spot is inside an equation, so nothing was changed: these tools do not write into an equation. "
                 "Use normal text outside it. To change the equation itself, remove it with word_delete_equation and insert a corrected one with word_insert_equation.")
@@ -670,6 +677,113 @@ def tool_add_comment(args):
     return f"Comment added on that text. The document now has {n_com} comments."
 
 
+FORMAT_FLAGS = ("bold", "italic", "underline", "superscript", "subscript")
+HIGHLIGHTS = ("yellow", "bright green", "turquoise", "pink", "blue", "red", "dark blue", "teal", "green", "violet",
+              "dark red", "dark yellow", "gray50", "gray25", "black")
+
+
+def as_flag(key, value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true"
+    raise ToolError(f"{key} must be true or false.")
+
+
+def parse_format(args):
+    """The formatting to apply, as an ordered list of (key, value for word_ops, wanted read-back, description)."""
+    props = []
+    for key in FORMAT_FLAGS:
+        if args.get(key) is not None:
+            on = as_flag(key, args[key])
+            props.append((key, "1" if on else "0", "1" if on else "0", f"{key} {'on' if on else 'off'}"))
+    if args.get("superscript") is True and args.get("subscript") is True:
+        raise ToolError("Text cannot be superscript and subscript at once; set only one of them.")
+    if args.get("color") is not None:
+        raw = str(args["color"]).strip()
+        if raw.lower() in ("auto", "automatic"):
+            props.append(("color", "auto", "auto", "automatic font colour"))
+        else:
+            m = re.fullmatch(r"#?([0-9A-Fa-f]{6})", raw)
+            if not m:
+                raise ToolError('color must be a hex RGB value such as "#C00000", or "auto" for the automatic colour.')
+            rgb = [int(m.group(1)[i:i + 2], 16) for i in (0, 2, 4)]
+            # Word's scripting interface takes 16-bit channels: 0-255 values would come out as black
+            wide = ",".join(str(v * 257) for v in rgb)
+            props.append(("color", wide, wide, f"font colour #{m.group(1).upper()}"))
+    if args.get("highlight") is not None:
+        raw = " ".join(str(args["highlight"]).strip().lower().replace("_", " ").replace("-", " ").split()).replace("grey", "gray")
+        raw = raw.replace("gray 50", "gray50").replace("gray 25", "gray25")
+        if raw in ("none", "no", "off", "no highlight", "remove"):
+            props.append(("highlight", "none", "none", "highlight removed"))
+        elif raw in HIGHLIGHTS:
+            props.append(("highlight", raw, raw, f"{raw} highlight"))
+        else:
+            raise ToolError("highlight must be one of: " + ", ".join(HIGHLIGHTS) + ', or "none" to remove it.')
+    if not props:
+        raise ToolError("Give at least one of bold, italic, underline, superscript, subscript, color or highlight.")
+    return props
+
+
+def tool_format_text(args):
+    name = args["document"]
+    cfg, spec = check_doc(name)
+    find = plain_only(to_word(args["find"]), "find text")
+    target = plain_only(to_word(args.get("target") or ""), "target text") or find
+    occurrence = max(0, int(args.get("occurrence", 0)))
+    allow_fields = bool(args.get("allow_field_changes", False))
+    if not find.strip():
+        raise ToolError("find must not be empty.")
+    if target not in find:
+        raise ToolError("target must be a piece of find, matching character for character.")
+    if find.count(target) > 1:
+        raise ToolError(f"target occurs {find.count(target)} times inside find, so it is unclear which to format. "
+                        "Shorten find, or let it end right after the piece you mean.")
+    props = parse_format(args)
+    prefix = find[:find.index(target)]
+    rest = run_word("format", spec, find, occurrence, cfg.get("author", "Claude"), "1" if allow_fields else "0",
+                    prefix, target, len(props), *[f"{key}={value}" for key, value, _, _ in props])
+    _, span, nr0, nr1, same, checks, already, had_rev, has_rev, ctx_a, ctx_b = rest.split(US, 10)
+    already = [key for key in already.split(GS) if key]
+    applied = [prop for prop in props if prop[0] not in already]
+    seen = dict((item.split("=", 1) + [""])[:2] for item in checks.split(GS) if item)
+    wrong = [f"{key}: wanted {wanted}, Word reports {seen.get(key, 'nothing')}" for key, _, wanted, _ in applied if seen.get(key) != wanted]
+    untracked = bool(applied) and not has_rev and not had_rev
+    verified = same == "1" and not wrong and not untracked
+    audit({"tool": "format_text", "document": name, "location": spec.partition(GS)[2], "find": find, "target": target,
+           "occurrence": occurrence, "format": {key: value for key, value, _, _ in applied}, "already": already,
+           "position": [int(x) for x in span.split("-")], "verified": verified})
+    if not applied:
+        return (f"Nothing was changed: {target!r} already has this formatting ("
+                + ", ".join(desc for _, _, _, desc in props) + ").")
+    lines = [f"Formatted {target!r} as a tracked formatting change: " + ", ".join(desc for _, _, _, desc in applied)
+             + ". The text itself was not changed."]
+    if already:
+        lines.append("Already so, and left as it was: " + ", ".join(desc for key, _, _, desc in props if key in already) + ".")
+    if has_rev == "revision insert":
+        lines.append(f"Word recorded it as a tracked change (the text is itself a pending insertion). The document has {nr1} pending revisions.")
+    elif has_rev:
+        lines.append(f"Word shows it as a formatting change (merged with any earlier formatting change by the same author on this text). "
+                     f"The document has {nr1} pending revisions.")
+    elif had_rev:
+        lines.append("This brought the formatting back to what it was before an earlier formatting change by the same author, "
+                     f"so Word dropped that change. The document has {nr1} pending revisions.")
+    else:
+        lines.append("WARNING: Word applied the formatting but did not record it as a tracked change, which means the option "
+                     "'Track formatting' is off in the user's Word (Review > Track Changes options). The change is NOT tracked. "
+                     "Stop formatting and tell the user.")
+    if same != "1":
+        lines.append("WARNING: the document's text read back differently from before, although only formatting should have changed. "
+                     "Stop editing this document and tell the user.")
+    if wrong:
+        lines.append("WARNING: Word does not report the requested formatting on that text (" + "; ".join(wrong) + "). "
+                     "Part of it may have been applied. Stop editing this document and tell the user.")
+    if verified:
+        shown = visible(prefix) + "«" + visible(target) + "»" + visible(find[len(prefix) + len(target):])
+        lines.append(f"Verified by reading the formatting back from Word. The passage reads: …{visible(ctx_a)}{shown}{visible(ctx_b)}…")
+    return "\n".join(lines)
+
+
 def tool_list_changes(args):
     name = args["document"]
     _, spec = check_doc(name)
@@ -678,7 +792,8 @@ def tool_list_changes(args):
     head, _, body = rest.partition(RS)
     n_rev, n_com = head.split(US)
     rev_part, _, com_part = body.partition(GS)
-    kinds = {"revision insert": "inserted", "revision delete": "deleted"}
+    kinds = {"revision insert": "inserted", "revision delete": "deleted", "revision property": "formatted",
+             "revision paragraph property": "paragraph formatted"}
     lines = [f"Document {name}: {n_rev} pending revisions, {n_com} comments."]
     if rev_part:
         lines.append("Revisions:")
@@ -1038,6 +1153,29 @@ TOOLS = [
          "occurrence": OCC_PROP},
          "required": ["document", "anchor", "comment"]},
      "handler": tool_add_comment},
+    {"name": "word_format_text",
+     "description": ("Change the formatting of a piece of text as a tracked formatting change, without changing the text: bold, italic, underline, "
+                     "font colour, highlight, superscript or subscript, each switched on or off. "
+                     "find locates the passage (character for character, and unique, or picked with occurrence); target is the part of find to format, "
+                     "so a word that occurs many times can be picked out with some context around it. Without target the whole of find is formatted. "
+                     "Equations are refused, and so are citations and other fields unless allow_field_changes is set, because Word or Zotero "
+                     "regenerates their text and would drop the formatting."),
+     "inputSchema": {"type": "object", "properties": {
+         "document": DOC_PROP,
+         "find": {"type": "string", "description": "Existing text in the document, with enough context to be unique."},
+         "target": {"type": "string", "description": "The part of find to format; it must occur only once inside find. Default: all of find."},
+         "occurrence": OCC_PROP,
+         "bold": {"type": "boolean", "description": "true makes the text bold, false removes bold."},
+         "italic": {"type": "boolean", "description": "true makes the text italic, false removes italic."},
+         "underline": {"type": "boolean", "description": "true adds a single underline, false removes underlining."},
+         "superscript": {"type": "boolean", "description": "true raises the text as superscript, false makes it normal again."},
+         "subscript": {"type": "boolean", "description": "true lowers the text as subscript, false makes it normal again."},
+         "color": {"type": "string", "description": "Font colour as hex RGB, for example \"#C00000\" (dark red) or \"#0070C0\" (blue); \"auto\" restores the automatic colour."},
+         "highlight": {"type": "string", "description": "Highlight colour: yellow, bright green, turquoise, pink, blue, red, dark blue, teal, green, violet, "
+                                                       "dark red, dark yellow, gray50, gray25 or black; \"none\" removes the highlight."},
+         "allow_field_changes": {"type": "boolean", "description": "Set to true only to format a citation or other field on purpose. Default false.", "default": False}},
+         "required": ["document", "find"]},
+     "handler": tool_format_text},
     {"name": "word_list_images",
      "description": "List the inline pictures in the document: index, displayed size, and the text above and below each (the text below is usually the caption). Use it before replacing a picture to confirm which one.",
      "inputSchema": {"type": "object", "properties": {"document": DOC_PROP}, "required": ["document"]},

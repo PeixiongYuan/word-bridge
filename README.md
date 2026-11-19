@@ -50,6 +50,7 @@ Only instructions, document text and replacement images travel over the tunnel. 
 | `word_replace_text` | Replaces text as a tracked change (empty replacement deletes) |
 | `word_insert_text` | Inserts text before or after an anchor, as a tracked change |
 | `word_add_comment` | Attaches a Word comment to a piece of text |
+| `word_format_text` | Makes text bold, italic, underlined, coloured, highlighted, superscript or subscript (or undoes that), as a tracked formatting change |
 | `word_list_images` | Lists the inline pictures with their size and the text above and below each |
 | `word_insert_image` | Inserts a new picture next to an anchor text, as a tracked change |
 | `word_replace_image` | Replaces one picture with a new image, as a tracked change |
@@ -108,6 +109,15 @@ The first time the server talks to Word, macOS may ask whether to allow it to co
 ```json
 { "permissions": { "allow": ["mcp__word-bridge__word_read_document", "mcp__word-bridge__word_replace_text"] } }
 ```
+
+## Formatting
+
+`word_format_text` changes how a piece of text looks without touching the text: bold, italic, single underline, font colour (any hex RGB, or back to automatic), highlight (Word's highlight colours, or none), superscript and subscript. Each can be switched on or off, and several can be combined in one call.
+
+- **Picking the text.** `find` locates the passage, as in the other tools; `target` is the part of it to format, so one occurrence of a common word can be picked out with some context around it.
+- **Tracked.** Word records the change as a formatting revision ("Formatted: Font: Bold" in the margin). The bridge checks for that revision afterwards. If Word applied the formatting without recording it, which happens when "Track formatting" is off in Word's Track Changes options, the result says so with a warning. AppleScript can neither read nor set that option.
+- **Read back.** Every property is read back from Word and compared with what was asked for, and the document text is compared with its state before the call. A property the text already has is left alone and reported.
+- **Protected.** Equations are refused. So are citations and other fields, because Word or the reference manager regenerates their text and drops formatting set on it by hand; `allow_field_changes: true` formats them anyway.
 
 ## Pictures
 
